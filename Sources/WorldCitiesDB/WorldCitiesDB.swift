@@ -7,7 +7,7 @@ public final class WorldCitiesDB: Sendable {
     /// All cities sorted by population (descending).
     private let cities: [City]
 
-    /// Bigram inverted index for keyword search.
+    /// Bigram inverted index for keyword search, or nil when index is disabled.
     private let searchIndex: SearchIndex
 
     /// Lookup table from geonameId to array index.
@@ -41,9 +41,9 @@ public final class WorldCitiesDB: Sendable {
         self.idIndex = idIdx
 
         start = CFAbsoluteTimeGetCurrent()
-        self.searchIndex = SearchIndex(cities: cities)
+        self.searchIndex = SearchIndex.build(cities: cities)
         let indexTime = CFAbsoluteTimeGetCurrent() - start
-        print("[\(Self.self)] Index build: \(String(format: "%.3f", indexTime))s")
+        print("[\(Self.self)] Index build: \(String(format: "%.3f", indexTime))s (\(searchIndex.memoryUsageBytes / 1024)KB)")
     }
 
     // MARK: - Binary Decoding
@@ -158,63 +158,93 @@ public final class WorldCitiesDB: Sendable {
 
     /// Searches cities by keyword (substring match on name and alternate names).
     /// Uses the bigram inverted index as a fast pre-filter, then verifies with substring matching.
-    /// Results are sorted by population (descending).
-    public func search(keyword: String) -> [City] {
-        let query = keyword.lowercased()
-        guard !query.isEmpty else { return [] }
+    /// - Parameter limit: Maximum number of results. Use `-1` (default) for all results.
+    /// - Parameter nameFirst: When `true` (default), results matching name/asciiName are returned
+    ///   before results matching only in alternateNames. Within each group, sorted by population.
+    public func search(keyword: String, limit: Int = -1, nameFirst: Bool = true) -> [SearchResult] {
+        let ctx = newSearch()
+        ctx.update(query: keyword)
+        return ctx.results(limit: limit, nameFirst: nameFirst)
+    }
 
-        let queryNoSpaces = query.filter { !$0.isWhitespace }
-        guard !queryNoSpaces.isEmpty else { return [] }
+    /// Creates a new search context for progressive query refinement.
+    public func newSearch() -> SearchContext {
+        SearchContext(cities: cities, index: searchIndex)
+    }
 
-        if let candidateList = searchIndex.candidates(for: query) {
-            // 2+ char query: use bigram candidates
-            var matches: [City] = []
-            for idx in candidateList {
-                let i = Int(idx)
-                if searchIndex.matchesSubstring(at: i, query: queryNoSpaces) {
-                    matches.append(cities[i])
+    /// Checks whether any of the city's name fields contain the query as a substring.
+    /// Query must already be lowercased. Checks asciiName first (always ASCII, fastest).
+    static func matchesCity(_ city: City, query: String) -> Bool {
+        containsIgnoringCase(city.asciiName, query) ||
+        containsIgnoringCase(city.name, query) ||
+        city.alternateNames.contains { containsIgnoringCase($0, query) }
+    }
+
+    /// Matches a city against the query and builds a SearchResult in one pass.
+    /// Returns nil if the city doesn't match. Avoids redundant containsIgnoringCase calls
+    /// compared to calling matchesCity + buildResult separately.
+    static func matchAndBuild(_ city: City, query: String) -> SearchResult? {
+        let matchedAsciiName = containsIgnoringCase(city.asciiName, query)
+        let matchedName = containsIgnoringCase(city.name, query)
+        let matchedAlternateNames = city.alternateNames.filter { containsIgnoringCase($0, query) }
+        guard matchedAsciiName || matchedName || !matchedAlternateNames.isEmpty else { return nil }
+        return SearchResult(
+            city: city,
+            matchedName: matchedName,
+            matchedAsciiName: matchedAsciiName,
+            matchedAlternateNames: matchedAlternateNames
+        )
+    }
+
+    /// Case-insensitive substring search optimized for ASCII strings.
+    /// The `query` must already be lowercased.
+    /// Uses direct UTF-8 byte comparison for ASCII (no heap allocation).
+    /// When the query is pure ASCII, non-ASCII haystack bytes are skipped (they can
+    /// never match). Only falls back to Foundation when the query itself is non-ASCII.
+    static func containsIgnoringCase(_ haystack: String, _ query: String) -> Bool {
+        var h = haystack
+        var q = query
+        return h.withUTF8 { hBuf in
+            q.withUTF8 { qBuf in
+                let hLen = hBuf.count
+                let qLen = qBuf.count
+                guard qLen > 0 else { return true }
+                guard qLen <= hLen else { return false }
+
+                // Check if query is pure ASCII
+                var queryIsASCII = true
+                for k in 0..<qLen {
+                    if qBuf[k] >= 0x80 { queryIsASCII = false; break }
                 }
-            }
-            matches.sort { $0.population > $1.population }
-            return matches
-        } else {
-            // 1-char query: linear scan
-            var matches: [City] = []
-            for i in 0..<cities.count {
-                if searchIndex.matchesSubstring(at: i, query: queryNoSpaces) {
-                    matches.append(cities[i])
+
+                let limit = hLen - qLen
+                for i in 0...limit {
+                    let hByte = hBuf[i]
+                    if hByte >= 0x80 {
+                        if queryIsASCII { continue }
+                        return haystack.lowercased().contains(query)
+                    }
+                    let hLower = (hByte >= 0x41 && hByte <= 0x5A) ? hByte &+ 0x20 : hByte
+                    if hLower == qBuf[0] {
+                        var matched = true
+                        for j in 1..<qLen {
+                            let hb = hBuf[i + j]
+                            if hb >= 0x80 {
+                                if queryIsASCII { matched = false; break }
+                                return haystack.lowercased().contains(query)
+                            }
+                            let hl = (hb >= 0x41 && hb <= 0x5A) ? hb &+ 0x20 : hb
+                            if hl != qBuf[j] {
+                                matched = false
+                                break
+                            }
+                        }
+                        if matched { return true }
+                    }
                 }
-            }
-            matches.sort { $0.population > $1.population }
-            return matches
-        }
-    }
-
-    /// Searches cities by keyword with a result limit.
-    /// Results are sorted by population (descending).
-    public func search(keyword: String, limit: Int) -> [City] {
-        Array(search(keyword: keyword).prefix(limit))
-    }
-
-    /// Naive linear scan search for performance comparison.
-    /// Iterates all cities and checks substring match. Results sorted by population (descending).
-    public func searchLinear(keyword: String, limit: Int) -> [City] {
-        let query = keyword.lowercased().filter { !$0.isWhitespace }
-        guard !query.isEmpty else { return [] }
-
-        var matches: [City] = []
-        for i in 0..<cities.count {
-            if searchIndex.matchesSubstring(at: i, query: query) {
-                matches.append(cities[i])
+                return false
             }
         }
-        matches.sort { $0.population > $1.population }
-        return Array(matches.prefix(limit))
-    }
-
-    /// Creates a new incremental search session for search bar use.
-    public func newSearch() -> CitySearch {
-        CitySearch(cities: cities, index: searchIndex)
     }
 
     // MARK: - Queries

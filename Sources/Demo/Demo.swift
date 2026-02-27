@@ -1,18 +1,18 @@
 import Foundation
 import WorldCitiesDB
 
-/// Returns "CityName (CC)" if the query matches name/asciiName,
+/// Returns "CityName (CC)" if the query matched name/asciiName,
 /// or "CityName (CC) via «altName»" if it matched an alternate name.
-func describeMatch(_ city: City, query: String) -> String {
-    let q = query.lowercased().filter { !$0.isWhitespace }
+func describeMatch(_ result: SearchResult) -> String {
+    let city = result.city
     let base = "\(city.name) (\(city.countryCode))"
 
-    if city.name.lowercased().contains(q) || city.asciiName.lowercased().contains(q) {
+    if result.matchedPrimaryName {
         return base
     }
 
-    if let match = city.alternateNames.first(where: { $0.lowercased().contains(q) }) {
-        return "\(base) via \"\(match)\""
+    if let first = result.matchedAlternateNames.first {
+        return "\(base) via \"\(first)\""
     }
 
     return base
@@ -35,31 +35,19 @@ struct Demo {
         let totalTime = CFAbsoluteTimeGetCurrent() - start
         print("Total load: \(String(format: "%.3f", totalTime))s\n")
 
-        // 2. Performance comparison: bigram index vs linear scan
-        let testQueries = ["york", "new", "tok", "bei", "paris", "san", "x"]
-        print("=== Performance: bigram index vs linear scan ===")
-        print("Query       Bigram      Linear      Results  Match?")
-        print(String(repeating: "-", count: 60))
+        // 2. Search performance (1-char queries use deferred scan, 2+ char use bigram index)
+        // Note: first 2+ char query triggers lazy bigram index build
+        let testQueries = ["x", "yo", "tok", "beij", "paris", "new york", "京", "münchen"]
+        print("=== Search Performance ===")
+        print("Query         Time        Results")
+        print(String(repeating: "-", count: 45))
 
         for query in testQueries {
             start = CFAbsoluteTimeGetCurrent()
-            let bigramResults = db.search(keyword: query, limit: 10)
-            let bigramTime = CFAbsoluteTimeGetCurrent() - start
-
-            start = CFAbsoluteTimeGetCurrent()
-            let linearResults = db.searchLinear(keyword: query, limit: 10)
-            let linearTime = CFAbsoluteTimeGetCurrent() - start
-
-            let match = bigramResults.map(\.geonameId) == linearResults.map(\.geonameId)
-            let q = query.padding(toLength: 10, withPad: " ", startingAt: 0)
-            let bt = String(format: "%8.3fms", bigramTime * 1000)
-            let lt = String(format: "%8.3fms", linearTime * 1000)
-            print("\(q)  \(bt)  \(lt)  \(String(format: "%5d", bigramResults.count))    \(match ? "OK" : "MISMATCH")")
-
-            if !match {
-                print("  Bigram:  \(bigramResults.map { "\($0.name)(\($0.geonameId))" })")
-                print("  Linear:  \(linearResults.map { "\($0.name)(\($0.geonameId))" })")
-            }
+            let results = db.search(keyword: query)
+            let time = CFAbsoluteTimeGetCurrent() - start
+            let q = query.padding(toLength: 12, withPad: " ", startingAt: 0)
+            print("\(q)  \(String(format: "%8.3fms", time * 1000))  \(String(format: "%5d", results.count))")
         }
         print()
 
@@ -70,23 +58,23 @@ struct Demo {
             let searchTime = CFAbsoluteTimeGetCurrent() - start
             let total = db.search(keyword: query)
             print("=== Search: \"\(query)\" — \(total.count) total, showing top \(results.count) (\(String(format: "%.3f", searchTime * 1000))ms) ===")
-            for city in results {
-                printCity(city)
+            for result in results {
+                printCity(result.city)
             }
             print()
         }
 
-        // 4. Incremental search (simulating a search bar)
-        print("=== Incremental search ===")
+        // 4. Progressive search refinement
+        print("=== Progressive search ===")
         let search = db.newSearch()
 
         for query in ["t", "to", "tok", "toky", "tokyo"] {
             start = CFAbsoluteTimeGetCurrent()
             search.update(query: query)
-            let top = search.results(limit: 3)
+            let all = search.results(limit: -1)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            let names = top.map { describeMatch($0, query: query) }.joined(separator: ", ")
-            print("  \"\(query)\" → \(names)  (\(String(format: "%.3f", elapsed * 1000))ms)")
+            let names = all.prefix(5).map { describeMatch($0) }.joined(separator: ", ")
+            print("  \"\(query)\" → \(all.count) total: \(names)  (\(String(format: "%.3f", elapsed * 1000))ms)")
         }
 
         // 5. Backspace simulation
@@ -96,8 +84,8 @@ struct Demo {
         let backspaceResults = search.results(limit: 5)
         let backspaceTime = CFAbsoluteTimeGetCurrent() - start
         print("  \(backspaceResults.count) results shown:")
-        for city in backspaceResults {
-            printCity(city)
+        for result in backspaceResults {
+            printCity(result.city)
         }
         print("  (\(String(format: "%.3f", backspaceTime * 1000))ms)\n")
 

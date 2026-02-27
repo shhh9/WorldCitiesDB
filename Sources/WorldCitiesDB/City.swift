@@ -56,3 +56,18 @@ public struct City: Codable, Identifiable, Sendable {
         self.modificationDate = modificationDate
     }
 }
+
+/// A search result containing the matched city and details about which fields matched.
+public struct SearchResult: Sendable {
+    /// The matched city.
+    public let city: City
+    /// Whether the query matched the city's `name` field.
+    public let matchedName: Bool
+    /// Whether the query matched the city's `asciiName` field.
+    public let matchedAsciiName: Bool
+    /// The alternate names that matched the query.
+    public let matchedAlternateNames: [String]
+
+    /// Whether the match was in name or asciiName (as opposed to only in alternateNames).
+    public var matchedPrimaryName: Bool { matchedName || matchedAsciiName }
+}
