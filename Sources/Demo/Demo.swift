@@ -23,7 +23,7 @@ func printCity(_ city: City, indent: String = "  ") {
         city.alternateNames.prefix(5).joined(separator: ", ")
         + (city.alternateNames.count > 5 ? " (+\(city.alternateNames.count - 5) more)" : "")
     print("\(indent)\(city.name) | ascii: \(city.asciiName) | alt: \(altNames)")
-    print("\(indent)  cc: \(city.countryCode) | pop: \(city.population) | tz: \(city.timezone ?? "?") | id: \(city.geonameId)")
+    print("\(indent)  cc: \(city.countryCode) | admin1: \(city.admin1Name ?? "?") | admin2: \(city.admin2Name ?? "?") | pop: \(city.population) | tz: \(city.timezone ?? "?") | id: \(city.geonameId)")
 }
 
 @main

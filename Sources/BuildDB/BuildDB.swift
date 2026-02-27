@@ -58,6 +58,52 @@ struct BuildDB {
         }
         print("Unzipped cities500.txt")
 
+        // 2b. Download admin1CodesASCII.txt
+        let admin1Path = tempDir.appendingPathComponent("admin1CodesASCII.txt")
+        print("Downloading admin1CodesASCII.txt...")
+        let admin1Curl = Process()
+        admin1Curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        admin1Curl.arguments = ["-#", "-L", "-o", admin1Path.path,
+                                "https://download.geonames.org/export/dump/admin1CodesASCII.txt"]
+        try admin1Curl.run()
+        admin1Curl.waitUntilExit()
+        guard admin1Curl.terminationStatus == 0 else {
+            fatalError("Failed to download admin1CodesASCII.txt")
+        }
+
+        // Parse admin1 lookup: "CC.admin1Code" → asciiName
+        let admin1Text = try String(contentsOf: admin1Path, encoding: .utf8)
+        var admin1Lookup: [String: String] = [:]
+        for line in admin1Text.components(separatedBy: "\n") where !line.isEmpty {
+            let cols = line.components(separatedBy: "\t")
+            guard cols.count >= 3 else { continue }
+            admin1Lookup[cols[0]] = cols[2]  // cols[0] = "CC.code", cols[2] = asciiName
+        }
+        print("Loaded \(admin1Lookup.count) admin1 codes")
+
+        // 2c. Download admin2Codes.txt
+        let admin2Path = tempDir.appendingPathComponent("admin2Codes.txt")
+        print("Downloading admin2Codes.txt...")
+        let admin2Curl = Process()
+        admin2Curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        admin2Curl.arguments = ["-#", "-L", "-o", admin2Path.path,
+                                "https://download.geonames.org/export/dump/admin2Codes.txt"]
+        try admin2Curl.run()
+        admin2Curl.waitUntilExit()
+        guard admin2Curl.terminationStatus == 0 else {
+            fatalError("Failed to download admin2Codes.txt")
+        }
+
+        // Parse admin2 lookup: "CC.admin1Code.admin2Code" → asciiName
+        let admin2Text = try String(contentsOf: admin2Path, encoding: .utf8)
+        var admin2Lookup: [String: String] = [:]
+        for line in admin2Text.components(separatedBy: "\n") where !line.isEmpty {
+            let cols = line.components(separatedBy: "\t")
+            guard cols.count >= 3 else { continue }
+            admin2Lookup[cols[0]] = cols[2]  // cols[0] = "CC.admin1.admin2", cols[2] = asciiName
+        }
+        print("Loaded \(admin2Lookup.count) admin2 codes")
+
         // 3. Parse tab-separated data into City structs
         let txtData = try String(contentsOf: txtPath, encoding: .utf8)
         let lines = txtData.components(separatedBy: "\n").filter { !$0.isEmpty }
@@ -90,6 +136,18 @@ struct BuildDB {
             // Parse modification date
             let modDate: Date? = fields[18].isEmpty ? nil : dateFormatter.date(from: fields[18])
 
+            // Resolve admin1 and admin2 names
+            let admin1Code = fields[10].isEmpty ? nil : fields[10]
+            let admin1Name: String? = admin1Code.flatMap { code in
+                admin1Lookup["\(fields[8]).\(code)"]
+            }
+            let admin2Code = fields[11].isEmpty ? nil : fields[11]
+            let admin2Name: String? = admin1Code.flatMap { a1 in
+                admin2Code.flatMap { a2 in
+                    admin2Lookup["\(fields[8]).\(a1).\(a2)"]
+                }
+            }
+
             let city = City(
                 geonameId: Int(fields[0]) ?? 0,
                 name: fields[1],
@@ -101,8 +159,10 @@ struct BuildDB {
                 featureCode: fields[7].isEmpty ? nil : fields[7],
                 countryCode: fields[8],
                 cc2: cc2,
-                admin1Code: fields[10].isEmpty ? nil : fields[10],
-                admin2Code: fields[11].isEmpty ? nil : fields[11],
+                admin1Code: admin1Code,
+                admin1Name: admin1Name,
+                admin2Code: admin2Code,
+                admin2Name: admin2Name,
                 admin3Code: fields[12].isEmpty ? nil : fields[12],
                 admin4Code: fields[13].isEmpty ? nil : fields[13],
                 population: Int(fields[14]) ?? 0,
@@ -144,6 +204,27 @@ struct BuildDB {
 
         let fileSize = fileData.count
         print("Done! Data saved to \(outputPath) (\(fileSize / 1024 / 1024) MB)")
+
+        // 7. Verify: print top 10 cities
+        print("\n=== Top 10 cities by population ===")
+        for city in cities.prefix(10) {
+            let altNames = city.alternateNames.isEmpty ? "(none)" :
+                city.alternateNames.prefix(3).joined(separator: ", ")
+                + (city.alternateNames.count > 3 ? " (+\(city.alternateNames.count - 3) more)" : "")
+            print("  \(city.name) | ascii: \(city.asciiName) | alt: \(altNames)")
+            print("    id: \(city.geonameId) | cc: \(city.countryCode) | admin1: \(city.admin1Name ?? "?") (\(city.admin1Code ?? "?")) | admin2: \(city.admin2Name ?? "?") (\(city.admin2Code ?? "?"))")
+            print("    lat: \(city.latitude) | lon: \(city.longitude) | pop: \(city.population) | elev: \(city.elevation.map(String.init) ?? "?") | dem: \(city.dem.map(String.init) ?? "?") | tz: \(city.timezone ?? "?")")
+        }
+
+        print("\n=== Top 10 US cities by population ===")
+        for city in cities.filter({ $0.countryCode == "US" }).prefix(10) {
+            let altNames = city.alternateNames.isEmpty ? "(none)" :
+                city.alternateNames.prefix(3).joined(separator: ", ")
+                + (city.alternateNames.count > 3 ? " (+\(city.alternateNames.count - 3) more)" : "")
+            print("  \(city.name) | ascii: \(city.asciiName) | alt: \(altNames)")
+            print("    id: \(city.geonameId) | cc: \(city.countryCode) | admin1: \(city.admin1Name ?? "?") (\(city.admin1Code ?? "?")) | admin2: \(city.admin2Name ?? "?") (\(city.admin2Code ?? "?"))")
+            print("    lat: \(city.latitude) | lon: \(city.longitude) | pop: \(city.population) | elev: \(city.elevation.map(String.init) ?? "?") | dem: \(city.dem.map(String.init) ?? "?") | tz: \(city.timezone ?? "?")")
+        }
     }
 
     // MARK: - Binary Serialization
@@ -177,6 +258,8 @@ struct BuildDB {
             appendOptionalInt(&data, city.dem)
             appendOptionalString(&data, city.timezone)
             appendOptionalDate(&data, city.modificationDate)
+            appendOptionalString(&data, city.admin1Name)
+            appendOptionalString(&data, city.admin2Name)
         }
 
         return data

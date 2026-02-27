@@ -126,6 +126,8 @@ public final class WorldCitiesDB: Sendable {
                 let dem = reader.readOptionalInt()
                 let timezone = reader.readOptionalString()
                 let modificationDate = reader.readOptionalDate()
+                let admin1Name = reader.readOptionalString()
+                let admin2Name = reader.readOptionalString()
 
                 cities.append(City(
                     geonameId: geonameId,
@@ -139,7 +141,9 @@ public final class WorldCitiesDB: Sendable {
                     countryCode: countryCode,
                     cc2: cc2,
                     admin1Code: admin1Code,
+                    admin1Name: admin1Name,
                     admin2Code: admin2Code,
+                    admin2Name: admin2Name,
                     admin3Code: admin3Code,
                     admin4Code: admin4Code,
                     population: population,
