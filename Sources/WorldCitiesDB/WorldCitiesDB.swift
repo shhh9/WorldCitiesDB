@@ -176,9 +176,29 @@ public final class WorldCitiesDB: Sendable {
         SearchContext(cities: cities, index: searchIndex)
     }
 
+    /// Lowercased query string with pre-computed properties for fast substring matching.
+    struct Query {
+        let value: String
+        let isASCII: Bool
+        /// Whether the query is case-invariant (e.g. CJK, Arabic) — lowercased == uppercased.
+        /// When true, a direct byte scan suffices without lowercasing the haystack.
+        let isCaseInvariant: Bool
+
+        init(_ rawQuery: String) {
+            let lowered = rawQuery.lowercased().trimmingCharacters(in: .whitespaces)
+            self.value = lowered
+            var ascii = true
+            for byte in lowered.utf8 {
+                if byte >= 0x80 { ascii = false; break }
+            }
+            self.isASCII = ascii
+            self.isCaseInvariant = !ascii && self.value.uppercased() == self.value
+        }
+    }
+
     /// Checks whether any of the city's name fields contain the query as a substring.
-    /// Query must already be lowercased. Checks asciiName first (always ASCII, fastest).
-    static func matchesCity(_ city: City, query: String) -> Bool {
+    /// Checks asciiName first (always ASCII, fastest).
+    static func matchesCity(_ city: City, query: Query) -> Bool {
         containsIgnoringCase(city.asciiName, query) ||
         containsIgnoringCase(city.name, query) ||
         city.alternateNames.contains { containsIgnoringCase($0, query) }
@@ -187,7 +207,7 @@ public final class WorldCitiesDB: Sendable {
     /// Matches a city against the query and builds a SearchResult in one pass.
     /// Returns nil if the city doesn't match. Avoids redundant containsIgnoringCase calls
     /// compared to calling matchesCity + buildResult separately.
-    static func matchAndBuild(_ city: City, query: String) -> SearchResult? {
+    static func matchAndBuild(_ city: City, query: Query) -> SearchResult? {
         let matchedAsciiName = containsIgnoringCase(city.asciiName, query)
         let matchedName = containsIgnoringCase(city.name, query)
         let matchedAlternateNames = city.alternateNames.filter { containsIgnoringCase($0, query) }
@@ -200,14 +220,16 @@ public final class WorldCitiesDB: Sendable {
         )
     }
 
-    /// Case-insensitive substring search optimized for ASCII strings.
-    /// The `query` must already be lowercased.
-    /// Uses direct UTF-8 byte comparison for ASCII (no heap allocation).
-    /// When the query is pure ASCII, non-ASCII haystack bytes are skipped (they can
-    /// never match). Only falls back to Foundation when the query itself is non-ASCII.
-    static func containsIgnoringCase(_ haystack: String, _ query: String) -> Bool {
+    /// Case-insensitive substring search optimized for common cases.
+    /// - ASCII query: direct UTF-8 byte comparison with inline case folding (no allocation).
+    ///   Non-ASCII haystack bytes are skipped since they can never match.
+    /// - Non-ASCII case-invariant query (CJK, Arabic, etc.): direct UTF-8 byte scan on the
+    ///   raw haystack — zero allocation.
+    /// - Non-ASCII case-variant query (ü, ñ, Cyrillic, etc.): first tries direct byte scan,
+    ///   then falls back to lowercasing the haystack.
+    static func containsIgnoringCase(_ haystack: String, _ query: Query) -> Bool {
         var h = haystack
-        var q = query
+        var q = query.value
         return h.withUTF8 { hBuf in
             q.withUTF8 { qBuf in
                 let hLen = hBuf.count
@@ -215,30 +237,37 @@ public final class WorldCitiesDB: Sendable {
                 guard qLen > 0 else { return true }
                 guard qLen <= hLen else { return false }
 
-                // Check if query is pure ASCII
-                var queryIsASCII = true
-                for k in 0..<qLen {
-                    if qBuf[k] >= 0x80 { queryIsASCII = false; break }
+                if query.isASCII {
+                    // Fast ASCII path: compare bytes directly, skip non-ASCII haystack bytes
+                    let limit = hLen - qLen
+                    for i in 0...limit {
+                        let hByte = hBuf[i]
+                        if hByte >= 0x80 { continue }
+                        let hLower = (hByte >= 0x41 && hByte <= 0x5A) ? hByte &+ 0x20 : hByte
+                        if hLower == qBuf[0] {
+                            var matched = true
+                            for j in 1..<qLen {
+                                let hb = hBuf[i + j]
+                                if hb >= 0x80 { matched = false; break }
+                                let hl = (hb >= 0x41 && hb <= 0x5A) ? hb &+ 0x20 : hb
+                                if hl != qBuf[j] {
+                                    matched = false
+                                    break
+                                }
+                            }
+                            if matched { return true }
+                        }
+                    }
+                    return false
                 }
 
+                // Non-ASCII query: direct UTF-8 byte scan on the raw haystack.
                 let limit = hLen - qLen
                 for i in 0...limit {
-                    let hByte = hBuf[i]
-                    if hByte >= 0x80 {
-                        if queryIsASCII { continue }
-                        return haystack.lowercased().contains(query)
-                    }
-                    let hLower = (hByte >= 0x41 && hByte <= 0x5A) ? hByte &+ 0x20 : hByte
-                    if hLower == qBuf[0] {
+                    if hBuf[i] == qBuf[0] {
                         var matched = true
                         for j in 1..<qLen {
-                            let hb = hBuf[i + j]
-                            if hb >= 0x80 {
-                                if queryIsASCII { matched = false; break }
-                                return haystack.lowercased().contains(query)
-                            }
-                            let hl = (hb >= 0x41 && hb <= 0x5A) ? hb &+ 0x20 : hb
-                            if hl != qBuf[j] {
+                            if hBuf[i + j] != qBuf[j] {
                                 matched = false
                                 break
                             }
@@ -246,7 +275,32 @@ public final class WorldCitiesDB: Sendable {
                         if matched { return true }
                     }
                 }
-                return false
+
+                // For case-invariant scripts (CJK, Arabic, Hebrew, etc.), the direct scan
+                // is definitive — no uppercase variants exist, so no fallback needed.
+                if query.isCaseInvariant { return false }
+
+                // Case-variant non-ASCII (e.g. Ü/ü, Ñ/ñ, Cyrillic, Greek):
+                // lowercase the haystack and scan again.
+                var lowered = haystack.lowercased()
+                return lowered.withUTF8 { lBuf in
+                    let lLen = lBuf.count
+                    guard qLen <= lLen else { return false }
+                    let searchLimit = lLen - qLen
+                    for pos in 0...searchLimit {
+                        if lBuf[pos] == qBuf[0] {
+                            var matched = true
+                            for k in 1..<qLen {
+                                if lBuf[pos + k] != qBuf[k] {
+                                    matched = false
+                                    break
+                                }
+                            }
+                            if matched { return true }
+                        }
+                    }
+                    return false
+                }
             }
         }
     }

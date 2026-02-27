@@ -22,7 +22,7 @@ public final class SearchContext {
     private let cities: [City]
     private let index: SearchIndex
 
-    private var lastQuery: String = ""
+    private var lastQuery: WorldCitiesDB.Query?
     /// Indices into `cities` of verified matches for lastQuery, in population order.
     private var lastMatches: [Int32] = []
     /// Bigram-narrowed candidate indices (only maintained when index has bigrams).
@@ -30,7 +30,8 @@ public final class SearchContext {
 
     /// Whether the last query is a deferred 1-char query (no scan performed yet).
     private var isPendingScan: Bool {
-        lastQuery.unicodeScalars.count == 1 && lastMatches.isEmpty
+        guard let q = lastQuery else { return false }
+        return q.value.unicodeScalars.count == 1 && lastMatches.isEmpty
     }
 
     init(cities: [City], index: SearchIndex) {
@@ -44,21 +45,21 @@ public final class SearchContext {
     /// are filtered rather than rescanning all cities. One-character queries
     /// are deferred — no scanning happens until `results()` is called.
     public func update(query rawQuery: String) {
-        let query = rawQuery.lowercased().trimmingCharacters(in: .whitespaces)
+        let query = WorldCitiesDB.Query(rawQuery)
         defer { lastQuery = query }
 
         // Empty or 1-char query: clear cached state. 1-char scans are deferred to results().
-        if query.unicodeScalars.count <= 1 {
+        if query.value.unicodeScalars.count <= 1 {
             lastMatches = []
             lastBigramCandidates = nil
             return
         }
 
         // Incremental path: new query extends the previous one
-        if !lastQuery.isEmpty && query.hasPrefix(lastQuery) && query != lastQuery {
+        if let lastQuery, !lastQuery.value.isEmpty && query.value.hasPrefix(lastQuery.value) && query.value != lastQuery.value {
             if isPendingScan {
                 // Previous was a deferred 1-char query — use bigram index directly
-                if let candidates = index.candidates(for: query) {
+                if let candidates = index.candidates(for: query.value) {
                     lastBigramCandidates = candidates
                     var matches: [Int32] = []
                     for i in candidates {
@@ -77,8 +78,8 @@ public final class SearchContext {
 
             if index.hasBigrams, var candidates = lastBigramCandidates {
                 // Narrow existing bigram candidates with new bigrams
-                let oldScalars = Array(lastQuery.unicodeScalars)
-                let newScalars = Array(query.unicodeScalars)
+                let oldScalars = Array(lastQuery.value.unicodeScalars)
+                let newScalars = Array(query.value.unicodeScalars)
                 let startIdx = max(oldScalars.count - 1, 0)
                 for j in startIdx..<(newScalars.count - 1) {
                     let key = SearchIndex.bigramKey(newScalars[j], newScalars[j + 1])
@@ -105,7 +106,7 @@ public final class SearchContext {
                 matches.sort { cities[Int($0)].population > cities[Int($1)].population }
                 lastMatches = matches
                 return
-            } else if let candidates = index.candidates(for: query) {
+            } else if let candidates = index.candidates(for: query.value) {
                 // Previous query had no bigram candidates — use bigram index directly
                 lastBigramCandidates = candidates
                 var matches: [Int32] = []
@@ -131,8 +132,8 @@ public final class SearchContext {
     }
 
     /// Full recompute using bigram index or linear scan.
-    private func fullRecompute(_ query: String) {
-        if let candidates = index.candidates(for: query) {
+    private func fullRecompute(_ query: WorldCitiesDB.Query) {
+        if let candidates = index.candidates(for: query.value) {
             lastBigramCandidates = candidates
             var matches: [Int32] = []
             for i in candidates {
@@ -160,10 +161,15 @@ public final class SearchContext {
     /// - Parameter nameFirst: When `true` (default), results matching name/asciiName appear
     ///   before results matching only in alternateNames. Within each group, sorted by population.
     public func results(limit: Int = 20, nameFirst: Bool = true) -> [SearchResult] {
-        let query = lastQuery
+        guard let query = lastQuery else {
+            let effectiveLimit = limit < 0 ? Int.max : limit
+            return Array(cities.prefix(effectiveLimit).map {
+                SearchResult(city: $0, matchedName: false, matchedAsciiName: false, matchedAlternateNames: [])
+            })
+        }
         let effectiveLimit = limit < 0 ? Int.max : limit
 
-        guard !query.isEmpty else {
+        guard !query.value.isEmpty else {
             return Array(cities.prefix(effectiveLimit).map {
                 SearchResult(city: $0, matchedName: false, matchedAsciiName: false, matchedAlternateNames: [])
             })
