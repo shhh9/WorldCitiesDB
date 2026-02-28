@@ -62,8 +62,8 @@ public final class WorldCitiesDB<C: CityRepresentable>: Sendable {
             ))
         }
 
-        // Parse binary payload
-        return try decompressed.withUnsafeBytes { buffer in
+        // Parse binary payload directly into user-defined city values.
+        let cities = try decompressed.withUnsafeBytes { buffer in
             var reader = BinaryReader(buffer: buffer)
 
             // Header
@@ -93,5 +93,9 @@ public final class WorldCitiesDB<C: CityRepresentable>: Sendable {
 
             return cities
         }
+
+        // Drop intermediate internal decode storage as soon as parsing completes.
+        decompressed.removeAll(keepingCapacity: false)
+        return cities
     }
 }

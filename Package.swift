@@ -30,5 +30,9 @@ let package = Package(
             name: "Demo",
             dependencies: ["WorldCitiesDB"]
         ),
+        .testTarget(
+            name: "WorldCitiesDBTests",
+            dependencies: ["WorldCitiesDB"]
+        ),
     ]
 )

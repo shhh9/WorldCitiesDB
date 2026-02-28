@@ -6,7 +6,7 @@ import WorldCitiesDB
 struct WorldClockCity: CityRepresentable, SearchableCity {
     let name: String
     let asciiName: String
-    let alternateNames: String        // UTF-8, \t-joined (exact match search)
+    let alternateNames: String        // UTF-8, \t-joined (substring search)
     let alternateAsciiNames: String   // ASCII, \t-joined (case-insensitive search)
     let timezone: String
     let countryCode: String
@@ -26,11 +26,27 @@ struct WorldClockCity: CityRepresentable, SearchableCity {
 
     // SearchableCity — \t never appears in names or queries, so no splitting needed
     func matchesASCII(_ test: (String) -> Bool) -> Bool {
-        test(asciiName) || test(alternateAsciiNames)
+        matchesPrimaryASCII(test) || matchesAlternateASCII(test)
     }
 
     func matchesUTF8(_ test: (String) -> Bool) -> Bool {
-        test(name) || test(alternateNames)
+        matchesPrimaryUTF8(test) || matchesAlternateUTF8(test)
+    }
+
+    func matchesPrimaryASCII(_ test: (String) -> Bool) -> Bool {
+        test(asciiName)
+    }
+
+    func matchesAlternateASCII(_ test: (String) -> Bool) -> Bool {
+        test(alternateAsciiNames)
+    }
+
+    func matchesPrimaryUTF8(_ test: (String) -> Bool) -> Bool {
+        test(name)
+    }
+
+    func matchesAlternateUTF8(_ test: (String) -> Bool) -> Bool {
+        test(alternateNames)
     }
 }
 
