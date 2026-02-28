@@ -2,16 +2,16 @@ import Compression
 import Foundation
 
 /// Provides read-only access to the bundled world cities database.
-public final class WorldCitiesDB: Sendable {
+///
+/// Generic over the city type — users define their own struct with only the fields they need.
+/// Cities are pre-sorted by population (descending) from the binary.
+public final class WorldCitiesDB<C: CityRepresentable>: Sendable {
 
     /// All cities sorted by population (descending).
-    private let cities: [City]
+    public let cities: [C]
 
-    /// Bigram inverted index for keyword search, or nil when index is disabled.
-    private let searchIndex: SearchIndex
-
-    /// Lookup table from geonameId to array index.
-    private let idIndex: [Int: Int]
+    /// Total number of cities.
+    public var count: Int { cities.count }
 
     /// Creates a new instance using the bundled cities data.
     public convenience init() throws {
@@ -21,34 +21,14 @@ public final class WorldCitiesDB: Sendable {
         try self.init(data: Data(contentsOf: url))
     }
 
-    /// Creates an instance from a custom data file path.
-    public convenience init(path: String) throws {
-        try self.init(data: Data(contentsOf: URL(fileURLWithPath: path)))
-    }
-
     /// Creates an instance from pre-loaded LZ4-compressed binary data.
     public init(data: Data) throws {
-        var start = CFAbsoluteTimeGetCurrent()
         self.cities = try Self.decodeBinary(from: data)
-        let decodeTime = CFAbsoluteTimeGetCurrent() - start
-        print("[\(Self.self)] Binary decode: \(String(format: "%.3f", decodeTime))s (\(cities.count) cities)")
-
-        var idIdx: [Int: Int] = [:]
-        idIdx.reserveCapacity(cities.count)
-        for (i, city) in cities.enumerated() {
-            idIdx[city.geonameId] = i
-        }
-        self.idIndex = idIdx
-
-        start = CFAbsoluteTimeGetCurrent()
-        self.searchIndex = SearchIndex.build(cities: cities)
-        let indexTime = CFAbsoluteTimeGetCurrent() - start
-        print("[\(Self.self)] Index build: \(String(format: "%.3f", indexTime))s (\(searchIndex.memoryUsageBytes / 1024)KB)")
     }
 
     // MARK: - Binary Decoding
 
-    private static func decodeBinary(from fileData: Data) throws -> [City] {
+    private static func decodeBinary(from fileData: Data) throws -> [C] {
         guard fileData.count > 8 else {
             throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "File too small"))
         }
@@ -88,14 +68,14 @@ public final class WorldCitiesDB: Sendable {
 
             // Header
             let magic = reader.readUInt32()
-            guard magic == 0x4244_4357 else { // "WCDB" as little-endian UInt32
+            guard magic == 0x4244_4357 else { // "WCDB"
                 throw DecodingError.dataCorrupted(.init(
                     codingPath: [],
                     debugDescription: "Invalid magic: \(String(magic, radix: 16))"
                 ))
             }
             let version = reader.readUInt32()
-            guard version == 1 else {
+            guard version == 2 else {
                 throw DecodingError.dataCorrupted(.init(
                     codingPath: [],
                     debugDescription: "Unsupported version: \(version)"
@@ -103,309 +83,15 @@ public final class WorldCitiesDB: Sendable {
             }
             let cityCount = Int(reader.readUInt32())
 
-            var cities: [City] = []
+            var cities: [C] = []
             cities.reserveCapacity(cityCount)
 
             for _ in 0..<cityCount {
-                let geonameId = Int(reader.readInt64())
-                let name = reader.readString()
-                let asciiName = reader.readString()
-                let alternateNames = reader.readStringArray()
-                let latitude = reader.readDouble()
-                let longitude = reader.readDouble()
-                let featureClass = reader.readOptionalString()
-                let featureCode = reader.readOptionalString()
-                let countryCode = reader.readString()
-                let cc2 = reader.readStringArray()
-                let admin1Code = reader.readOptionalString()
-                let admin2Code = reader.readOptionalString()
-                let admin3Code = reader.readOptionalString()
-                let admin4Code = reader.readOptionalString()
-                let population = Int(reader.readInt64())
-                let elevation = reader.readOptionalInt()
-                let dem = reader.readOptionalInt()
-                let timezone = reader.readOptionalString()
-                let modificationDate = reader.readOptionalDate()
-                let admin1Name = reader.readOptionalString()
-                let admin2Name = reader.readOptionalString()
-
-                cities.append(City(
-                    geonameId: geonameId,
-                    name: name,
-                    asciiName: asciiName,
-                    alternateNames: alternateNames,
-                    latitude: latitude,
-                    longitude: longitude,
-                    featureClass: featureClass,
-                    featureCode: featureCode,
-                    countryCode: countryCode,
-                    cc2: cc2,
-                    admin1Code: admin1Code,
-                    admin1Name: admin1Name,
-                    admin2Code: admin2Code,
-                    admin2Name: admin2Name,
-                    admin3Code: admin3Code,
-                    admin4Code: admin4Code,
-                    population: population,
-                    elevation: elevation,
-                    dem: dem,
-                    timezone: timezone,
-                    modificationDate: modificationDate
-                ))
+                let fields = CityFields(reader: &reader)
+                cities.append(C(from: fields))
             }
 
             return cities
         }
-    }
-
-    // MARK: - Search
-
-    /// Searches cities by keyword (substring match on name and alternate names).
-    /// Uses the bigram inverted index as a fast pre-filter, then verifies with substring matching.
-    /// - Parameter limit: Maximum number of results. Use `-1` (default) for all results.
-    /// - Parameter nameFirst: When `true` (default), results matching name/asciiName are returned
-    ///   before results matching only in alternateNames. Within each group, sorted by population.
-    public func search(keyword: String, limit: Int = -1, nameFirst: Bool = true) -> [SearchResult] {
-        let ctx = newSearch()
-        ctx.update(query: keyword)
-        return ctx.results(limit: limit, nameFirst: nameFirst)
-    }
-
-    /// Creates a new search context for progressive query refinement.
-    public func newSearch() -> SearchContext {
-        SearchContext(cities: cities, index: searchIndex)
-    }
-
-    /// Lowercased query string with pre-computed properties for fast substring matching.
-    struct Query {
-        let value: String
-        let isASCII: Bool
-        /// Whether the query is case-invariant (e.g. CJK, Arabic) — lowercased == uppercased.
-        /// When true, a direct byte scan suffices without lowercasing the haystack.
-        let isCaseInvariant: Bool
-
-        init(_ rawQuery: String) {
-            let lowered = rawQuery.lowercased().trimmingCharacters(in: .whitespaces)
-            self.value = lowered
-            var ascii = true
-            for byte in lowered.utf8 {
-                if byte >= 0x80 { ascii = false; break }
-            }
-            self.isASCII = ascii
-            self.isCaseInvariant = !ascii && self.value.uppercased() == self.value
-        }
-    }
-
-    /// Checks whether any of the city's name fields contain the query as a substring.
-    /// Checks asciiName first (always ASCII, fastest).
-    static func matchesCity(_ city: City, query: Query) -> Bool {
-        containsIgnoringCase(city.asciiName, query) ||
-        containsIgnoringCase(city.name, query) ||
-        city.alternateNames.contains { containsIgnoringCase($0, query) }
-    }
-
-    /// Matches a city against the query and builds a SearchResult in one pass.
-    /// Returns nil if the city doesn't match. Avoids redundant containsIgnoringCase calls
-    /// compared to calling matchesCity + buildResult separately.
-    static func matchAndBuild(_ city: City, query: Query) -> SearchResult? {
-        let matchedAsciiName = containsIgnoringCase(city.asciiName, query)
-        let matchedName = containsIgnoringCase(city.name, query)
-        let matchedAlternateNames = city.alternateNames.filter { containsIgnoringCase($0, query) }
-        guard matchedAsciiName || matchedName || !matchedAlternateNames.isEmpty else { return nil }
-        return SearchResult(
-            city: city,
-            matchedName: matchedName,
-            matchedAsciiName: matchedAsciiName,
-            matchedAlternateNames: matchedAlternateNames
-        )
-    }
-
-    /// Case-insensitive substring search optimized for common cases.
-    /// - ASCII query: direct UTF-8 byte comparison with inline case folding (no allocation).
-    ///   Non-ASCII haystack bytes are skipped since they can never match.
-    /// - Non-ASCII case-invariant query (CJK, Arabic, etc.): direct UTF-8 byte scan on the
-    ///   raw haystack — zero allocation.
-    /// - Non-ASCII case-variant query (ü, ñ, Cyrillic, etc.): first tries direct byte scan,
-    ///   then falls back to lowercasing the haystack.
-    static func containsIgnoringCase(_ haystack: String, _ query: Query) -> Bool {
-        var h = haystack
-        var q = query.value
-        return h.withUTF8 { hBuf in
-            q.withUTF8 { qBuf in
-                let hLen = hBuf.count
-                let qLen = qBuf.count
-                guard qLen > 0 else { return true }
-                guard qLen <= hLen else { return false }
-
-                if query.isASCII {
-                    // Fast ASCII path: compare bytes directly, skip non-ASCII haystack bytes
-                    let limit = hLen - qLen
-                    for i in 0...limit {
-                        let hByte = hBuf[i]
-                        if hByte >= 0x80 { continue }
-                        let hLower = (hByte >= 0x41 && hByte <= 0x5A) ? hByte &+ 0x20 : hByte
-                        if hLower == qBuf[0] {
-                            var matched = true
-                            for j in 1..<qLen {
-                                let hb = hBuf[i + j]
-                                if hb >= 0x80 { matched = false; break }
-                                let hl = (hb >= 0x41 && hb <= 0x5A) ? hb &+ 0x20 : hb
-                                if hl != qBuf[j] {
-                                    matched = false
-                                    break
-                                }
-                            }
-                            if matched { return true }
-                        }
-                    }
-                    return false
-                }
-
-                // Non-ASCII query: direct UTF-8 byte scan on the raw haystack.
-                let limit = hLen - qLen
-                for i in 0...limit {
-                    if hBuf[i] == qBuf[0] {
-                        var matched = true
-                        for j in 1..<qLen {
-                            if hBuf[i + j] != qBuf[j] {
-                                matched = false
-                                break
-                            }
-                        }
-                        if matched { return true }
-                    }
-                }
-
-                // For case-invariant scripts (CJK, Arabic, Hebrew, etc.), the direct scan
-                // is definitive — no uppercase variants exist, so no fallback needed.
-                if query.isCaseInvariant { return false }
-
-                // Case-variant non-ASCII (e.g. Ü/ü, Ñ/ñ, Cyrillic, Greek):
-                // lowercase the haystack and scan again.
-                var lowered = haystack.lowercased()
-                return lowered.withUTF8 { lBuf in
-                    let lLen = lBuf.count
-                    guard qLen <= lLen else { return false }
-                    let searchLimit = lLen - qLen
-                    for pos in 0...searchLimit {
-                        if lBuf[pos] == qBuf[0] {
-                            var matched = true
-                            for k in 1..<qLen {
-                                if lBuf[pos + k] != qBuf[k] {
-                                    matched = false
-                                    break
-                                }
-                            }
-                            if matched { return true }
-                        }
-                    }
-                    return false
-                }
-            }
-        }
-    }
-
-    // MARK: - Queries
-
-    /// Returns all cities sorted by population (descending).
-    /// Warning: this returns ~185,000 entries.
-    public func allCities() -> [City] {
-        cities
-    }
-
-    /// Returns cities in a specific country (ISO-3166 2-letter code).
-    public func cities(inCountry countryCode: String) -> [City] {
-        cities.filter { $0.countryCode == countryCode }
-    }
-
-    /// Returns cities with population greater than or equal to the given value,
-    /// sorted by population (descending).
-    public func cities(minPopulation: Int) -> [City] {
-        cities.filter { $0.population >= minPopulation }
-    }
-
-    /// Returns a city by its GeoNames ID.
-    public func city(id: Int) -> City? {
-        guard let idx = idIndex[id] else { return nil }
-        return cities[idx]
-    }
-
-    /// Returns cities within a bounding box.
-    public func cities(
-        minLatitude: Double, maxLatitude: Double,
-        minLongitude: Double, maxLongitude: Double
-    ) -> [City] {
-        cities.filter {
-            $0.latitude >= minLatitude && $0.latitude <= maxLatitude &&
-            $0.longitude >= minLongitude && $0.longitude <= maxLongitude
-        }
-    }
-
-    /// Returns the total number of cities.
-    public func count() -> Int {
-        cities.count
-    }
-}
-
-// MARK: - BinaryReader
-
-private struct BinaryReader {
-    let buffer: UnsafeRawBufferPointer
-    var offset: Int = 0
-
-    mutating func readUInt32() -> UInt32 {
-        let value = buffer.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
-        offset += 4
-        return value
-    }
-
-    mutating func readInt64() -> Int64 {
-        let value = buffer.loadUnaligned(fromByteOffset: offset, as: Int64.self).littleEndian
-        offset += 8
-        return value
-    }
-
-    mutating func readDouble() -> Double {
-        let bits = buffer.loadUnaligned(fromByteOffset: offset, as: UInt64.self).littleEndian
-        offset += 8
-        return Double(bitPattern: bits)
-    }
-
-    mutating func readString() -> String {
-        let length = Int(readUInt32())
-        let str = String(unsafeUninitializedCapacity: length) { buf in
-            buf.baseAddress!.update(from: buffer.baseAddress!.advanced(by: offset).assumingMemoryBound(to: UInt8.self), count: length)
-            return length
-        }
-        offset += length
-        return str
-    }
-
-    mutating func readOptionalString() -> String? {
-        let flag = buffer.load(fromByteOffset: offset, as: UInt8.self)
-        offset += 1
-        return flag == 1 ? readString() : nil
-    }
-
-    mutating func readStringArray() -> [String] {
-        let count = Int(readUInt32())
-        var result: [String] = []
-        result.reserveCapacity(count)
-        for _ in 0..<count {
-            result.append(readString())
-        }
-        return result
-    }
-
-    mutating func readOptionalInt() -> Int? {
-        let flag = buffer.load(fromByteOffset: offset, as: UInt8.self)
-        offset += 1
-        return flag == 1 ? Int(readInt64()) : nil
-    }
-
-    mutating func readOptionalDate() -> Date? {
-        let flag = buffer.load(fromByteOffset: offset, as: UInt8.self)
-        offset += 1
-        return flag == 1 ? Date(timeIntervalSinceReferenceDate: readDouble()) : nil
     }
 }

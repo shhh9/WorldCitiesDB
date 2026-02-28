@@ -2,6 +2,14 @@ import Compression
 import Foundation
 import WorldCitiesDB
 
+func printCity(_ city: City, indent: String = "  ") {
+    print("\(indent)id: \(city.geonameId)")
+    for child in Mirror(reflecting: city).children {
+        guard let label = child.label else { continue }
+        print("\(indent)\(label): \(String(describing: child.value))")
+    }
+}
+
 @main
 struct BuildDB {
     static func main() async throws {
@@ -23,11 +31,41 @@ struct BuildDB {
 
         print("Output path: \(outputPath)")
 
-        // 1. Download cities500.zip
+        // 1. Create temp workspace
         let tempDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: tempDir) }
 
+        // 2. Download and cache admin code tables first
+        let admin1Path = tempDir.appendingPathComponent("admin1CodesASCII.txt")
+        print("Downloading admin1CodesASCII.txt...")
+        let admin1Curl = Process()
+        admin1Curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        admin1Curl.arguments = ["-#", "-L", "-o", admin1Path.path,
+                                "https://download.geonames.org/export/dump/admin1CodesASCII.txt"]
+        try admin1Curl.run()
+        admin1Curl.waitUntilExit()
+        guard admin1Curl.terminationStatus == 0 else {
+            fatalError("Failed to download admin1CodesASCII.txt")
+        }
+        let admin1Lookup = try loadAdmin1Lookup(from: admin1Path)
+        print("Loaded \(admin1Lookup.count) admin1 codes")
+
+        let admin2Path = tempDir.appendingPathComponent("admin2Codes.txt")
+        print("Downloading admin2Codes.txt...")
+        let admin2Curl = Process()
+        admin2Curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        admin2Curl.arguments = ["-#", "-L", "-o", admin2Path.path,
+                                "https://download.geonames.org/export/dump/admin2Codes.txt"]
+        try admin2Curl.run()
+        admin2Curl.waitUntilExit()
+        guard admin2Curl.terminationStatus == 0 else {
+            fatalError("Failed to download admin2Codes.txt")
+        }
+        let admin2Lookup = try loadAdmin2Lookup(from: admin2Path)
+        print("Loaded \(admin2Lookup.count) admin2 codes")
+
+        // 3. Download cities500.zip
         let zipPath = tempDir.appendingPathComponent("cities500.zip")
         print("Downloading cities500.zip...")
         let curlProcess = Process()
@@ -39,8 +77,8 @@ struct BuildDB {
         guard curlProcess.terminationStatus == 0 else {
             fatalError("Failed to download cities500.zip")
         }
-        let zipData = try Data(contentsOf: zipPath)
-        print("Downloaded \(zipData.count) bytes")
+        let zipSize = (try fileManager.attributesOfItem(atPath: zipPath.path)[.size] as? NSNumber)?.intValue ?? 0
+        print("Downloaded \(zipSize) bytes")
 
         let unzipProcess = Process()
         unzipProcess.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
@@ -58,56 +96,9 @@ struct BuildDB {
         }
         print("Unzipped cities500.txt")
 
-        // 2b. Download admin1CodesASCII.txt
-        let admin1Path = tempDir.appendingPathComponent("admin1CodesASCII.txt")
-        print("Downloading admin1CodesASCII.txt...")
-        let admin1Curl = Process()
-        admin1Curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        admin1Curl.arguments = ["-#", "-L", "-o", admin1Path.path,
-                                "https://download.geonames.org/export/dump/admin1CodesASCII.txt"]
-        try admin1Curl.run()
-        admin1Curl.waitUntilExit()
-        guard admin1Curl.terminationStatus == 0 else {
-            fatalError("Failed to download admin1CodesASCII.txt")
-        }
-
-        // Parse admin1 lookup: "CC.admin1Code" → asciiName
-        let admin1Text = try String(contentsOf: admin1Path, encoding: .utf8)
-        var admin1Lookup: [String: String] = [:]
-        for line in admin1Text.components(separatedBy: "\n") where !line.isEmpty {
-            let cols = line.components(separatedBy: "\t")
-            guard cols.count >= 3 else { continue }
-            admin1Lookup[cols[0]] = cols[2]  // cols[0] = "CC.code", cols[2] = asciiName
-        }
-        print("Loaded \(admin1Lookup.count) admin1 codes")
-
-        // 2c. Download admin2Codes.txt
-        let admin2Path = tempDir.appendingPathComponent("admin2Codes.txt")
-        print("Downloading admin2Codes.txt...")
-        let admin2Curl = Process()
-        admin2Curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        admin2Curl.arguments = ["-#", "-L", "-o", admin2Path.path,
-                                "https://download.geonames.org/export/dump/admin2Codes.txt"]
-        try admin2Curl.run()
-        admin2Curl.waitUntilExit()
-        guard admin2Curl.terminationStatus == 0 else {
-            fatalError("Failed to download admin2Codes.txt")
-        }
-
-        // Parse admin2 lookup: "CC.admin1Code.admin2Code" → asciiName
-        let admin2Text = try String(contentsOf: admin2Path, encoding: .utf8)
-        var admin2Lookup: [String: String] = [:]
-        for line in admin2Text.components(separatedBy: "\n") where !line.isEmpty {
-            let cols = line.components(separatedBy: "\t")
-            guard cols.count >= 3 else { continue }
-            admin2Lookup[cols[0]] = cols[2]  // cols[0] = "CC.admin1.admin2", cols[2] = asciiName
-        }
-        print("Loaded \(admin2Lookup.count) admin2 codes")
-
-        // 3. Parse tab-separated data into City structs
+        // 4. Parse tab-separated data into City structs with dictionary lookups
         let txtData = try String(contentsOf: txtPath, encoding: .utf8)
-        let lines = txtData.components(separatedBy: "\n").filter { !$0.isEmpty }
-        print("Parsing \(lines.count) cities...")
+        print("Parsing cities...")
 
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
@@ -115,70 +106,85 @@ struct BuildDB {
         dateFormatter.timeZone = TimeZone(identifier: "UTC")
 
         var cities: [City] = []
-        cities.reserveCapacity(lines.count)
+        cities.reserveCapacity(230_000)
+        var modificationDateCache: [String: Date] = [:]
+        modificationDateCache.reserveCapacity(256)
 
-        for line in lines {
-            let fields = line.components(separatedBy: "\t")
-            guard fields.count >= 19 else { continue }
+        txtData.enumerateLines { line, _ in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count >= 19 else { return }
 
-            // Split alternateNames by comma, trim, filter empties
-            let altNames: [String] = fields[3].isEmpty ? [] :
-                fields[3].components(separatedBy: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-
-            // Split cc2 by comma, trim, filter empties
-            let cc2: [String] = fields[9].isEmpty ? [] :
-                fields[9].components(separatedBy: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-
-            // Parse modification date
-            let modDate: Date? = fields[18].isEmpty ? nil : dateFormatter.date(from: fields[18])
-
-            // Resolve admin1 and admin2 names
-            let admin1Code = fields[10].isEmpty ? nil : fields[10]
-            let admin1Name: String? = admin1Code.flatMap { code in
-                admin1Lookup["\(fields[8]).\(code)"]
+            let countryCode = String(fields[8])
+            let admin1Code = parseOptionalField(fields[10])
+            let admin2Code = parseOptionalField(fields[11])
+            let admin1Name = admin1Code.flatMap { code in
+                admin1Lookup[makeAdmin1LookupKey(countryCode: countryCode, admin1Code: code)]
             }
-            let admin2Code = fields[11].isEmpty ? nil : fields[11]
-            let admin2Name: String? = admin1Code.flatMap { a1 in
+            let admin2Name = admin1Code.flatMap { a1 in
                 admin2Code.flatMap { a2 in
-                    admin2Lookup["\(fields[8]).\(a1).\(a2)"]
+                    admin2Lookup[makeAdmin2LookupKey(countryCode: countryCode, admin1Code: a1, admin2Code: a2)]
+                }
+            }
+            let modificationDate: Date?
+            if fields[18].isEmpty {
+                modificationDate = nil
+            } else {
+                let dateKey = String(fields[18])
+                if let cached = modificationDateCache[dateKey] {
+                    modificationDate = cached
+                } else {
+                    let parsed = dateFormatter.date(from: dateKey)
+                    if let parsed {
+                        modificationDateCache[dateKey] = parsed
+                    }
+                    modificationDate = parsed
+                }
+            }
+
+            // Split alternate names into ASCII vs non-ASCII at build time
+            var altAscii: [String] = []
+            var altNonAscii: [String] = []
+            for alt in parseCSVField(fields[3]) {
+                if alt.utf8.allSatisfy({ $0 < 0x80 }) {
+                    altAscii.append(alt)
+                } else {
+                    altNonAscii.append(alt)
                 }
             }
 
             let city = City(
                 geonameId: Int(fields[0]) ?? 0,
-                name: fields[1],
-                asciiName: fields[2],
-                alternateNames: altNames,
+                name: String(fields[1]),
+                asciiName: String(fields[2]),
+                alternateNames: altNonAscii,
+                alternateAsciiNames: altAscii,
                 latitude: Double(fields[4]) ?? 0.0,
                 longitude: Double(fields[5]) ?? 0.0,
-                featureClass: fields[6].isEmpty ? nil : fields[6],
-                featureCode: fields[7].isEmpty ? nil : fields[7],
-                countryCode: fields[8],
-                cc2: cc2,
+                featureClass: parseOptionalField(fields[6]),
+                featureCode: parseOptionalField(fields[7]),
+                countryCode: countryCode,
+                cc2: parseCSVField(fields[9]),
                 admin1Code: admin1Code,
                 admin1Name: admin1Name,
                 admin2Code: admin2Code,
                 admin2Name: admin2Name,
-                admin3Code: fields[12].isEmpty ? nil : fields[12],
-                admin4Code: fields[13].isEmpty ? nil : fields[13],
+                admin3Code: parseOptionalField(fields[12]),
+                admin4Code: parseOptionalField(fields[13]),
                 population: Int(fields[14]) ?? 0,
                 elevation: fields[15].isEmpty ? nil : Int(fields[15]),
                 dem: fields[16].isEmpty ? nil : Int(fields[16]),
-                timezone: fields[17].isEmpty ? nil : fields[17],
-                modificationDate: modDate
+                timezone: parseOptionalField(fields[17]),
+                modificationDate: modificationDate
             )
             cities.append(city)
         }
+        print("Parsed \(cities.count) cities")
 
-        // 4. Sort by population descending
+        // 5. Sort by population descending
         cities.sort { $0.population > $1.population }
         print("Sorted \(cities.count) cities by population")
 
-        // 5. Encode as LZ4-compressed binary
+        // 6. Encode as LZ4-compressed binary
         let payload = serializeCities(cities)
         print("Uncompressed payload: \(payload.count) bytes")
 
@@ -191,7 +197,7 @@ struct BuildDB {
         fileData.append(Data(bytes: &uncompressedSize, count: 8))
         fileData.append(compressed)
 
-        // 6. Write to output path
+        // 7. Write to output path
         let outputDir = URL(fileURLWithPath: outputPath).deletingLastPathComponent()
         try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
@@ -205,26 +211,94 @@ struct BuildDB {
         let fileSize = fileData.count
         print("Done! Data saved to \(outputPath) (\(fileSize / 1024 / 1024) MB)")
 
-        // 7. Verify: print top 10 cities
+        // 8. Verify: print top 10 cities
         print("\n=== Top 10 cities by population ===")
         for city in cities.prefix(10) {
-            let altNames = city.alternateNames.isEmpty ? "(none)" :
-                city.alternateNames.prefix(3).joined(separator: ", ")
-                + (city.alternateNames.count > 3 ? " (+\(city.alternateNames.count - 3) more)" : "")
-            print("  \(city.name) | ascii: \(city.asciiName) | alt: \(altNames)")
-            print("    id: \(city.geonameId) | cc: \(city.countryCode) | admin1: \(city.admin1Name ?? "?") (\(city.admin1Code ?? "?")) | admin2: \(city.admin2Name ?? "?") (\(city.admin2Code ?? "?"))")
-            print("    lat: \(city.latitude) | lon: \(city.longitude) | pop: \(city.population) | elev: \(city.elevation.map(String.init) ?? "?") | dem: \(city.dem.map(String.init) ?? "?") | tz: \(city.timezone ?? "?")")
+            printCity(city)
+            print()
         }
 
         print("\n=== Top 10 US cities by population ===")
         for city in cities.filter({ $0.countryCode == "US" }).prefix(10) {
-            let altNames = city.alternateNames.isEmpty ? "(none)" :
-                city.alternateNames.prefix(3).joined(separator: ", ")
-                + (city.alternateNames.count > 3 ? " (+\(city.alternateNames.count - 3) more)" : "")
-            print("  \(city.name) | ascii: \(city.asciiName) | alt: \(altNames)")
-            print("    id: \(city.geonameId) | cc: \(city.countryCode) | admin1: \(city.admin1Name ?? "?") (\(city.admin1Code ?? "?")) | admin2: \(city.admin2Name ?? "?") (\(city.admin2Code ?? "?"))")
-            print("    lat: \(city.latitude) | lon: \(city.longitude) | pop: \(city.population) | elev: \(city.elevation.map(String.init) ?? "?") | dem: \(city.dem.map(String.init) ?? "?") | tz: \(city.timezone ?? "?")")
+            printCity(city)
+            print()
         }
+    }
+
+    // MARK: - Parsing Helpers
+
+    typealias Admin1Lookup = [String: String]
+    typealias Admin2Lookup = [String: String]
+
+    static func loadAdmin1Lookup(from path: URL) throws -> Admin1Lookup {
+        let text = try String(contentsOf: path, encoding: .utf8)
+        var lookup: Admin1Lookup = [:]
+        lookup.reserveCapacity(5000)
+
+        text.enumerateLines { line, _ in
+            let cols = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard cols.count >= 3 else { return }
+            lookup[String(cols[0])] = String(cols[2]) // ASCII name column
+        }
+
+        return lookup
+    }
+
+    static func loadAdmin2Lookup(from path: URL) throws -> Admin2Lookup {
+        let text = try String(contentsOf: path, encoding: .utf8)
+        var lookup: Admin2Lookup = [:]
+        lookup.reserveCapacity(400_000)
+
+        text.enumerateLines { line, _ in
+            let cols = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard cols.count >= 3 else { return }
+            lookup[String(cols[0])] = String(cols[2]) // ASCII name column
+        }
+
+        return lookup
+    }
+
+    @inline(__always)
+    static func makeAdmin1LookupKey(countryCode: String, admin1Code: String) -> String {
+        var key = String()
+        key.reserveCapacity(countryCode.count + admin1Code.count + 1)
+        key.append(countryCode)
+        key.append(".")
+        key.append(admin1Code)
+        return key
+    }
+
+    @inline(__always)
+    static func makeAdmin2LookupKey(countryCode: String, admin1Code: String, admin2Code: String) -> String {
+        var key = String()
+        key.reserveCapacity(countryCode.count + admin1Code.count + admin2Code.count + 2)
+        key.append(countryCode)
+        key.append(".")
+        key.append(admin1Code)
+        key.append(".")
+        key.append(admin2Code)
+        return key
+    }
+
+    @inline(__always)
+    static func parseOptionalField(_ field: Substring) -> String? {
+        field.isEmpty ? nil : String(field)
+    }
+
+    @inline(__always)
+    static func parseCSVField(_ field: Substring) -> [String] {
+        guard !field.isEmpty else { return [] }
+
+        var values: [String] = []
+        values.reserveCapacity(4)
+
+        for item in field.split(separator: ",", omittingEmptySubsequences: false) {
+            let trimmed = item.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            values.append(String(trimmed))
+        }
+
+        return values
     }
 
     // MARK: - Binary Serialization
@@ -233,9 +307,9 @@ struct BuildDB {
         // Estimate ~200 bytes per city
         var data = Data(capacity: 12 + cities.count * 200)
 
-        // Header: magic "WCDB" + version 1 + city count
+        // Header: magic "WCDB" + version 2 + city count
         data.append(contentsOf: [0x57, 0x43, 0x44, 0x42]) // "WCDB"
-        appendUInt32(&data, 1) // version
+        appendUInt32(&data, 2) // version
         appendUInt32(&data, UInt32(cities.count))
 
         for city in cities {
@@ -243,6 +317,7 @@ struct BuildDB {
             appendString(&data, city.name)
             appendString(&data, city.asciiName)
             appendStringArray(&data, city.alternateNames)
+            appendStringArray(&data, city.alternateAsciiNames)
             appendDouble(&data, city.latitude)
             appendDouble(&data, city.longitude)
             appendOptionalString(&data, city.featureClass)

@@ -1,17 +1,17 @@
 import Foundation
 
-/// A city from the GeoNames cities500 dataset.
-///
-/// Contains all cities with a population greater than 500 or that are seats
-/// of administrative divisions (approximately 229,000 entries worldwide).
-public struct City: Codable, Identifiable, Sendable {
+/// A city from the GeoNames cities500 dataset with all fields.
+public struct City: CityRepresentable, SearchableCity, Identifiable, Sendable {
     /// GeoNames unique identifier
     public var id: Int { geonameId }
 
     public let geonameId: Int
     public let name: String
     public let asciiName: String
+    /// Non-ASCII alternate names.
     public let alternateNames: [String]
+    /// ASCII-only alternate names.
+    public let alternateAsciiNames: [String]
     public let latitude: Double
     public let longitude: Double
     public let featureClass: String?
@@ -31,7 +31,8 @@ public struct City: Codable, Identifiable, Sendable {
     public let modificationDate: Date?
 
     public init(
-        geonameId: Int, name: String, asciiName: String, alternateNames: [String],
+        geonameId: Int, name: String, asciiName: String,
+        alternateNames: [String], alternateAsciiNames: [String],
         latitude: Double, longitude: Double, featureClass: String?, featureCode: String?,
         countryCode: String, cc2: [String], admin1Code: String?, admin1Name: String?,
         admin2Code: String?, admin2Name: String?, admin3Code: String?, admin4Code: String?,
@@ -42,6 +43,7 @@ public struct City: Codable, Identifiable, Sendable {
         self.name = name
         self.asciiName = asciiName
         self.alternateNames = alternateNames
+        self.alternateAsciiNames = alternateAsciiNames
         self.latitude = latitude
         self.longitude = longitude
         self.featureClass = featureClass
@@ -60,19 +62,52 @@ public struct City: Codable, Identifiable, Sendable {
         self.timezone = timezone
         self.modificationDate = modificationDate
     }
-}
 
-/// A search result containing the matched city and details about which fields matched.
-public struct SearchResult: Sendable {
-    /// The matched city.
-    public let city: City
-    /// Whether the query matched the city's `name` field.
-    public let matchedName: Bool
-    /// Whether the query matched the city's `asciiName` field.
-    public let matchedAsciiName: Bool
-    /// The alternate names that matched the query.
-    public let matchedAlternateNames: [String]
+    // MARK: - CityRepresentable
 
-    /// Whether the match was in name or asciiName (as opposed to only in alternateNames).
-    public var matchedPrimaryName: Bool { matchedName || matchedAsciiName }
+    public init(from fields: borrowing CityFields) {
+        self.geonameId = fields.geonameId
+        self.name = fields.name()
+        self.asciiName = fields.asciiName()
+        self.alternateNames = fields.alternateNames()
+        self.alternateAsciiNames = fields.alternateAsciiNames()
+        self.latitude = fields.latitude
+        self.longitude = fields.longitude
+        self.featureClass = fields.featureClass()
+        self.featureCode = fields.featureCode()
+        self.countryCode = fields.countryCode()
+        self.cc2 = fields.cc2()
+        self.admin1Code = fields.admin1Code()
+        self.admin1Name = fields.admin1Name()
+        self.admin2Code = fields.admin2Code()
+        self.admin2Name = fields.admin2Name()
+        self.admin3Code = fields.admin3Code()
+        self.admin4Code = fields.admin4Code()
+        self.population = fields.population
+        self.elevation = fields.elevation
+        self.dem = fields.dem
+        self.timezone = fields.timezone()
+        self.modificationDate = fields.modificationDate
+    }
+
+    // MARK: - SearchableCity
+
+    public func matchesASCII(_ test: (String) -> Bool) -> Bool {
+        test(asciiName) || alternateAsciiNames.contains { test($0) }
+    }
+
+    public func matchesUTF8(_ test: (String) -> Bool) -> Bool {
+        test(name) || alternateNames.contains { test($0) }
+    }
+
+    // MARK: - Debug
+
+    /// Dumps and prints all city fields in declaration order.
+    public func printCity(indent: String = "  ") {
+        print("\(indent)id: \(id)")
+        for child in Mirror(reflecting: self).children {
+            guard let label = child.label else { continue }
+            print("\(indent)\(label): \(String(describing: child.value))")
+        }
+    }
 }
