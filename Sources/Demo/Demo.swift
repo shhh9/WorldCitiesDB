@@ -24,29 +24,12 @@ struct WorldClockCity: CityRepresentable, SearchableCity {
         self.admin1Name = fields.admin1Name()
     }
 
-    // SearchableCity — \t never appears in names or queries, so no splitting needed
-    func matchesASCII(_ test: (String) -> Bool) -> Bool {
-        matchesPrimaryASCII(test) || matchesAlternateASCII(test)
+    func matchesPrimaryField(_ test: (String) -> Bool) -> Bool {
+        test(asciiName) || test(name)
     }
 
-    func matchesUTF8(_ test: (String) -> Bool) -> Bool {
-        matchesPrimaryUTF8(test) || matchesAlternateUTF8(test)
-    }
-
-    func matchesPrimaryASCII(_ test: (String) -> Bool) -> Bool {
-        test(asciiName)
-    }
-
-    func matchesAlternateASCII(_ test: (String) -> Bool) -> Bool {
-        test(alternateAsciiNames)
-    }
-
-    func matchesPrimaryUTF8(_ test: (String) -> Bool) -> Bool {
-        test(name)
-    }
-
-    func matchesAlternateUTF8(_ test: (String) -> Bool) -> Bool {
-        test(alternateNames)
+    func matchesAlternateField(_ test: (String) -> Bool) -> Bool {
+        test(alternateAsciiNames) || test(alternateNames)
     }
 }
 
@@ -140,7 +123,9 @@ struct Demo {
         print("\n\n========== Memory Comparison ==========")
         let citySize = MemoryLayout<City>.stride
         let clockSize = MemoryLayout<WorldClockCity>.stride
+        let bitmapBytes = 36 * ((db.count + 63) / 64) * 8
         print("City stride:           \(citySize) bytes × \(db.count) = \(citySize * db.count / 1024 / 1024) MB (shallow)")
         print("WorldClockCity stride: \(clockSize) bytes × \(clockDB.count) = \(clockSize * clockDB.count / 1024 / 1024) MB (shallow)")
+        print("Bitmap index:          \(bitmapBytes) bytes (\(bitmapBytes / 1024) KB)")
     }
 }

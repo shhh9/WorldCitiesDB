@@ -92,28 +92,12 @@ public struct City: CityRepresentable, SearchableCity, Identifiable, Sendable {
 
     // MARK: - SearchableCity
 
-    public func matchesASCII(_ test: (String) -> Bool) -> Bool {
-        matchesPrimaryASCII(test) || matchesAlternateASCII(test)
+    public func matchesPrimaryField(_ test: (String) -> Bool) -> Bool {
+        test(asciiName) || test(name)
     }
 
-    public func matchesUTF8(_ test: (String) -> Bool) -> Bool {
-        matchesPrimaryUTF8(test) || matchesAlternateUTF8(test)
-    }
-
-    public func matchesPrimaryASCII(_ test: (String) -> Bool) -> Bool {
-        test(asciiName)
-    }
-
-    public func matchesAlternateASCII(_ test: (String) -> Bool) -> Bool {
-        alternateAsciiNames.contains { test($0) }
-    }
-
-    public func matchesPrimaryUTF8(_ test: (String) -> Bool) -> Bool {
-        test(name)
-    }
-
-    public func matchesAlternateUTF8(_ test: (String) -> Bool) -> Bool {
-        alternateNames.contains { test($0) }
+    public func matchesAlternateField(_ test: (String) -> Bool) -> Bool {
+        alternateAsciiNames.contains(where: test) || alternateNames.contains(where: test)
     }
 
     // MARK: - Debug

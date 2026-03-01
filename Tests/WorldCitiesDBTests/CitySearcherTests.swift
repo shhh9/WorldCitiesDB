@@ -8,28 +8,12 @@ private struct TestCity: SearchableCity, Equatable, Sendable {
     let alternateNames: [String]
     let alternateAsciiNames: [String]
 
-    func matchesASCII(_ test: (String) -> Bool) -> Bool {
-        matchesPrimaryASCII(test) || matchesAlternateASCII(test)
+    func matchesPrimaryField(_ test: (String) -> Bool) -> Bool {
+        test(asciiName) || test(name)
     }
 
-    func matchesUTF8(_ test: (String) -> Bool) -> Bool {
-        matchesPrimaryUTF8(test) || matchesAlternateUTF8(test)
-    }
-
-    func matchesPrimaryASCII(_ test: (String) -> Bool) -> Bool {
-        test(asciiName)
-    }
-
-    func matchesAlternateASCII(_ test: (String) -> Bool) -> Bool {
-        alternateAsciiNames.contains(where: test)
-    }
-
-    func matchesPrimaryUTF8(_ test: (String) -> Bool) -> Bool {
-        test(name)
-    }
-
-    func matchesAlternateUTF8(_ test: (String) -> Bool) -> Bool {
-        alternateNames.contains(where: test)
+    func matchesAlternateField(_ test: (String) -> Bool) -> Bool {
+        alternateAsciiNames.contains(where: test) || alternateNames.contains(where: test)
     }
 }
 
