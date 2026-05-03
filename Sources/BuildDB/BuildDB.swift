@@ -1,4 +1,3 @@
-import Compression
 import Foundation
 import WorldCitiesDB
 
@@ -15,21 +14,26 @@ struct BuildDB {
     static func main() async throws {
         let fileManager = FileManager.default
 
-        // Determine output path
-        let outputPath: String
+        // Determine output paths.
+        let outputURL: URL
         if CommandLine.arguments.count > 1 {
-            outputPath = CommandLine.arguments[1]
+            let requested = URL(fileURLWithPath: CommandLine.arguments[1])
+            if requested.pathExtension == "wcdb" {
+                outputURL = requested
+            } else {
+                outputURL = requested.appendingPathComponent("cities.wcdb")
+            }
         } else {
-            // Default: write to Sources/WorldCitiesDB/Resources/cities.lz4
+            // Default: write to Sources/WorldCitiesDB/Resources.
             let scriptDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             let resourcesDir = scriptDir
                 .deletingLastPathComponent()
                 .appendingPathComponent("WorldCitiesDB")
                 .appendingPathComponent("Resources")
-            outputPath = resourcesDir.appendingPathComponent("cities.lz4").path
+            outputURL = resourcesDir.appendingPathComponent("cities.wcdb")
         }
 
-        print("Output path: \(outputPath)")
+        print("Output path: \(outputURL.path)")
 
         // 1. Create temp workspace
         let tempDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -184,34 +188,56 @@ struct BuildDB {
         cities.sort { $0.population > $1.population }
         print("Sorted \(cities.count) cities by population")
 
-        // 6. Encode as LZ4-compressed binary
-        let payload = serializeCities(cities)
-        print("Uncompressed payload: \(payload.count) bytes")
+        // 6. Prepare metadata shared by the city database and search cache.
+        let generatedAt = ISO8601DateFormatter().string(from: Date())
+        let cityMetadata = CityDatabaseMetadata(
+            schemaVersion: CityDatabaseFile.currentSchemaVersion,
+            generatedAt: generatedAt,
+            sourceName: "GeoNames cities500",
+            sourceURLs: [
+                "https://download.geonames.org/export/dump/cities500.zip",
+                "https://download.geonames.org/export/dump/admin1CodesASCII.txt",
+                "https://download.geonames.org/export/dump/admin2Codes.txt",
+            ],
+            cityCount: cities.count,
+            sortOrder: "populationDescending",
+            cityDataFingerprint: "",
+            searchDataFingerprint: "",
+            searchSchemaID: CityDatabaseFile.defaultSearchSchemaID,
+            foldOptionsVersion: CityDatabaseFile.currentFoldOptionsVersion,
+            includesAdmin1Names: true,
+            includesAdmin2Names: true
+        )
 
-        let compressed = try compressLZ4(payload)
-        print("LZ4 compressed: \(compressed.count) bytes")
+        // 7. Build precomputed search artifacts.
+        let searchStart = CFAbsoluteTimeGetCurrent()
+        let searchArtifacts = SearchArtifacts(cities: cities)
+        let searchElapsed = CFAbsoluteTimeGetCurrent() - searchStart
+        print("Built search artifacts in \(String(format: "%.3f", searchElapsed))s")
 
-        // Build final file: 8-byte uncompressed size + compressed data
-        var fileData = Data(capacity: 8 + compressed.count)
-        var uncompressedSize = UInt64(payload.count).littleEndian
-        fileData.append(Data(bytes: &uncompressedSize, count: 8))
-        fileData.append(compressed)
+        // 8. Encode city database with bundled search artifacts.
+        let encodeStart = CFAbsoluteTimeGetCurrent()
+        let encodedCityDatabase = try CityDatabaseFile.serializedData(
+            cities: cities,
+            metadata: cityMetadata,
+            searchArtifacts: searchArtifacts
+        )
+        let encodeElapsed = CFAbsoluteTimeGetCurrent() - encodeStart
+        print("Encoded database in \(String(format: "%.3f", encodeElapsed))s (\(encodedCityDatabase.data.count / 1024) KB)")
 
-        // 7. Write to output path
-        let outputDir = URL(fileURLWithPath: outputPath).deletingLastPathComponent()
+        // 9. Write output file.
+        let outputDir = outputURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
-        // Remove existing file if present
-        if fileManager.fileExists(atPath: outputPath) {
-            try fileManager.removeItem(atPath: outputPath)
+        if fileManager.fileExists(atPath: outputURL.path) {
+            try fileManager.removeItem(at: outputURL)
         }
 
-        try fileData.write(to: URL(fileURLWithPath: outputPath))
+        try encodedCityDatabase.data.write(to: outputURL)
 
-        let fileSize = fileData.count
-        print("Done! Data saved to \(outputPath) (\(fileSize / 1024 / 1024) MB)")
+        print("Done! Database saved to \(outputURL.path) (\(encodedCityDatabase.data.count / 1024 / 1024) MB)")
 
-        // 8. Verify: print top 10 cities
+        // 10. Verify: print top 10 cities.
         print("\n=== Top 10 cities by population ===")
         for city in cities.prefix(10) {
             printCity(city)
@@ -301,125 +327,4 @@ struct BuildDB {
         return values
     }
 
-    // MARK: - Binary Serialization
-
-    static func serializeCities(_ cities: [City]) -> Data {
-        // Estimate ~200 bytes per city
-        var data = Data(capacity: 12 + cities.count * 200)
-
-        // Header: magic "WCDB" + version 2 + city count
-        data.append(contentsOf: [0x57, 0x43, 0x44, 0x42]) // "WCDB"
-        appendUInt32(&data, 2) // version
-        appendUInt32(&data, UInt32(cities.count))
-
-        for city in cities {
-            appendInt64(&data, Int64(city.geonameId))
-            appendString(&data, city.name)
-            appendString(&data, city.asciiName)
-            appendStringArray(&data, city.alternateNames)
-            appendStringArray(&data, city.alternateAsciiNames)
-            appendDouble(&data, city.latitude)
-            appendDouble(&data, city.longitude)
-            appendOptionalString(&data, city.featureClass)
-            appendOptionalString(&data, city.featureCode)
-            appendString(&data, city.countryCode)
-            appendStringArray(&data, city.cc2)
-            appendOptionalString(&data, city.admin1Code)
-            appendOptionalString(&data, city.admin2Code)
-            appendOptionalString(&data, city.admin3Code)
-            appendOptionalString(&data, city.admin4Code)
-            appendInt64(&data, Int64(city.population))
-            appendOptionalInt(&data, city.elevation)
-            appendOptionalInt(&data, city.dem)
-            appendOptionalString(&data, city.timezone)
-            appendOptionalDate(&data, city.modificationDate)
-            appendOptionalString(&data, city.admin1Name)
-            appendOptionalString(&data, city.admin2Name)
-        }
-
-        return data
-    }
-
-    static func appendUInt32(_ data: inout Data, _ value: UInt32) {
-        var v = value.littleEndian
-        data.append(Data(bytes: &v, count: 4))
-    }
-
-    static func appendInt64(_ data: inout Data, _ value: Int64) {
-        var v = value.littleEndian
-        data.append(Data(bytes: &v, count: 8))
-    }
-
-    static func appendDouble(_ data: inout Data, _ value: Double) {
-        var v = value.bitPattern.littleEndian
-        data.append(Data(bytes: &v, count: 8))
-    }
-
-    static func appendString(_ data: inout Data, _ value: String) {
-        let utf8 = Array(value.utf8)
-        appendUInt32(&data, UInt32(utf8.count))
-        data.append(contentsOf: utf8)
-    }
-
-    static func appendOptionalString(_ data: inout Data, _ value: String?) {
-        if let value = value {
-            data.append(1)
-            appendString(&data, value)
-        } else {
-            data.append(0)
-        }
-    }
-
-    static func appendStringArray(_ data: inout Data, _ value: [String]) {
-        appendUInt32(&data, UInt32(value.count))
-        for s in value {
-            appendString(&data, s)
-        }
-    }
-
-    static func appendOptionalInt(_ data: inout Data, _ value: Int?) {
-        if let value = value {
-            data.append(1)
-            appendInt64(&data, Int64(value))
-        } else {
-            data.append(0)
-        }
-    }
-
-    static func appendOptionalDate(_ data: inout Data, _ value: Date?) {
-        if let value = value {
-            data.append(1)
-            appendDouble(&data, value.timeIntervalSinceReferenceDate)
-        } else {
-            data.append(0)
-        }
-    }
-
-    // MARK: - LZ4 Compression
-
-    static func compressLZ4(_ input: Data) throws -> Data {
-        let srcSize = input.count
-        let dstCapacity = srcSize + srcSize / 255 + 16 // worst-case LZ4 expansion
-        var dst = Data(count: dstCapacity)
-
-        let compressedSize = input.withUnsafeBytes { srcPtr in
-            dst.withUnsafeMutableBytes { dstPtr in
-                compression_encode_buffer(
-                    dstPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                    dstCapacity,
-                    srcPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                    srcSize,
-                    nil,
-                    COMPRESSION_LZ4
-                )
-            }
-        }
-
-        guard compressedSize > 0 else {
-            fatalError("LZ4 compression failed")
-        }
-
-        dst.count = compressedSize
-        return dst
-    }
 }

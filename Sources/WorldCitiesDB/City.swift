@@ -1,7 +1,7 @@
 import Foundation
 
 /// A city from the GeoNames cities500 dataset with all fields.
-public struct City: CityRepresentable, SearchableCity, Identifiable, Sendable {
+public struct City: CityRepresentable, SearchableCity, Identifiable {
     /// GeoNames unique identifier
     public var id: Int { geonameId }
 
@@ -92,12 +92,24 @@ public struct City: CityRepresentable, SearchableCity, Identifiable, Sendable {
 
     // MARK: - SearchableCity
 
-    public func matchesPrimaryField(_ test: (String) -> Bool) -> Bool {
-        test(asciiName) || test(name)
+    public func matchPrimaryNames(_ fastMatcher: (String) -> Bool, _ foldMatcher: (String) -> Bool) -> Bool {
+        match(name, fastMatcher, foldMatcher) || fastMatcher(asciiName)
     }
 
-    public func matchesAlternateField(_ test: (String) -> Bool) -> Bool {
-        alternateAsciiNames.contains(where: test) || alternateNames.contains(where: test)
+    public func matchAlternateNames(_ fastMatcher: (String) -> Bool, _ foldMatcher: (String) -> Bool) -> Bool {
+        alternateAsciiNames.contains(where: fastMatcher) || alternateNames.contains(where: { match($0, fastMatcher, foldMatcher) })
+    }
+
+    @inline(__always)
+    private func match(
+        _ field: String,
+        _ fastMatcher: (String) -> Bool,
+        _ foldMatcher: (String) -> Bool
+    ) -> Bool {
+        if CasefoldingCache.stringNeedsFoldLookup(field) {
+            return foldMatcher(field)
+        }
+        return fastMatcher(field)
     }
 
     // MARK: - Debug

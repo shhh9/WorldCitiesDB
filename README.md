@@ -30,16 +30,23 @@ Then add `WorldCitiesDB` to your target's dependencies:
 ```swift
 import WorldCitiesDB
 
-let db = try WorldCitiesDB()
+let db = try WorldCitiesDB<City>()
 
 // Search cities by keyword (searches name + alternate names, sorted by population)
-let results = db.search(keyword: "york", limit: 10)
+let searcher = CitySearcher(
+    cities: db.cities,
+    casefoldingCache: db.casefoldingCache,
+    searchIndex: db.searchIndex,
+    packedSearchFields: db.packedSearchFields
+)
+
+let results = searcher.search(query: "york", limit: 10)
 for city in results {
     print("\(city.name), \(city.countryCode) — pop. \(city.population)")
 }
 
 // Incremental search for search bar UI
-let search = db.newSearch()
+let search = searcher.newSearch()
 search.update(query: "n")       // narrows to cities matching 'n'
 search.update(query: "ne")      // further narrows with 'e'
 search.update(query: "new")     // further narrows with 'w'
@@ -47,27 +54,27 @@ search.update(query: "ne")      // user deleted 'w' → recomputes from "ne"
 let top = search.results(limit: 20)
 
 // Get all cities in a country (ISO-3166 2-letter code)
-let japanCities = db.cities(inCountry: "JP")
+let japanCities = db.cities.filter { $0.countryCode == "JP" }
 
 // Find large cities
-let megacities = db.cities(minPopulation: 1_000_000)
+let megacities = db.cities.filter { $0.population >= 1_000_000 }
 
 // Look up a city by GeoNames ID
-let tokyo = db.city(id: 1850147)
+let tokyo = db.cities.first { $0.geonameId == 1_850_147 }
 
 // Find cities in a bounding box
-let nearby = db.cities(
-    minLatitude: 35.5, maxLatitude: 36.0,
-    minLongitude: 139.5, maxLongitude: 140.0
-)
+let nearby = db.cities.filter {
+    (35.5...36.0).contains($0.latitude) &&
+    (139.5...140.0).contains($0.longitude)
+}
 
 // Total count
-let total = db.count()
+let total = db.count
 ```
 
 ## Quick Start (Build & Demo)
 
-Build the cities data file (downloads ~30 MB from GeoNames, takes a minute or so):
+Build the bundled city database file (downloads ~30 MB from GeoNames, takes a minute or so):
 
 ```bash
 swift run BuildDB
@@ -79,7 +86,15 @@ Run the demo in release mode to verify everything works:
 swift run -c release Demo
 ```
 
-The demo exercises keyword search, incremental search, country filter, megacities query, bounding box, and ID lookup.
+The demo exercises full and custom city projections, keyword search, incremental search, and memory reporting.
+
+Run the benchmark to compare search performance with and without each search structure:
+
+```bash
+swift run -c release Benchmark
+```
+
+It automatically runs the full suite (`none`, `casefold`, `index`, `both`) for limits `-1`, `100`, `50`, and `20`, prints each query result immediately, then prints per-mode totals and speedups.
 
 ## City Struct
 
@@ -109,9 +124,11 @@ The `City` struct contains the following properties:
 
 ## How It Works
 
-A GitHub Actions workflow runs weekly to download the latest [cities500](https://download.geonames.org/export/dump/) data from GeoNames, parse the tab-separated file, and build an LZ4-compressed binary data file. The data file is committed to the repository so it's included as a Swift package resource.
+A GitHub Actions workflow runs weekly to download the latest [cities500](https://download.geonames.org/export/dump/) data from GeoNames, parse the tab-separated file, and build one package resource:
 
-At runtime, the cities are loaded into memory and a bigram inverted index is built for fast keyword search. The index maps each unique 2-character bigram (from city names and alternate names) to the set of cities containing that bigram. Search queries intersect bigram posting lists to quickly narrow candidates, then verify with substring matching.
+- `cities.wcdb`: canonical city records, metadata, and precomputed search artifacts.
+
+At runtime, `cities.wcdb` is decoded as a single artifact. The prebuilt casefold cache, scalar search index, and packed search fields are required to be present and checksum-validated; runtime loading does not rebuild search structures.
 
 ## Data Source
 

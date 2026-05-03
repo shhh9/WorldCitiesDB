@@ -30,6 +30,10 @@ let package = Package(
             name: "Demo",
             dependencies: ["WorldCitiesDB"]
         ),
+        .executableTarget(
+            name: "Benchmark",
+            dependencies: ["WorldCitiesDB"]
+        ),
         .testTarget(
             name: "WorldCitiesDBTests",
             dependencies: ["WorldCitiesDB"]

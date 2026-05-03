@@ -18,12 +18,12 @@ jobs:
 
       - name: Build and run BuildDB
         run: |
-          swift run BuildDB Sources/WorldCitiesDB/Resources/cities.lz4
+          swift run BuildDB Sources/WorldCitiesDB/Resources/cities.wcdb
 
       - name: Check for changes
         id: check
         run: |
-          if git diff --quiet Sources/WorldCitiesDB/Resources/cities.lz4 2>/dev/null; then
+          if git diff --quiet Sources/WorldCitiesDB/Resources/cities.wcdb 2>/dev/null; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -34,7 +34,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Sources/WorldCitiesDB/Resources/cities.lz4
+          git add Sources/WorldCitiesDB/Resources/cities.wcdb
           git commit -m "Update cities database from GeoNames"
           git push
 

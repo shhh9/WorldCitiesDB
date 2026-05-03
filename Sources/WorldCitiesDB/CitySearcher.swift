@@ -1,484 +1,762 @@
 import Foundation
 
-/// Protocol for city types that support search. Implement to define which fields are searchable.
-public protocol SearchableCity: Sendable {
-    /// Call test on each primary field (e.g. name, asciiName). Return true on first match.
-    func matchesPrimaryField(_ test: (String) -> Bool) -> Bool
-    /// Call test on each alternate field. Return true on first match.
-    func matchesAlternateField(_ test: (String) -> Bool) -> Bool
+/// Protocol for city types that support search.
+public protocol SearchableCity {
+    func matchPrimaryNames(_ fastMatcher: (String) -> Bool, _ foldMatcher: (String) -> Bool) -> Bool
+    func matchAlternateNames(_ fastMatcher: (String) -> Bool, _ foldMatcher: (String) -> Bool) -> Bool
 }
 
-/// Searches an array of cities using a bitmap index. Cities must be pre-sorted by population (desc).
-public final class CitySearcher<C: SearchableCity>: Sendable {
-    let cities: [C]
+struct FoldLookupContext {
+    let rawTable: UnsafePointer<UInt64>
+    let displacements: UnsafePointer<Int32>
+    let tableSize: Int
+    let bucketCount: Int
+    let seed1: UInt32
+    let seed2: UInt32
+}
 
-    // Bitmap index: 36 chars (a-z=0-25, 0-9=26-35), each with wordCount UInt64s
-    let bitmaps: [UInt64]
-    let wordCount: Int
+struct FieldSpan {
+    let start: Int
+    let count: Int
+}
 
-    public init(cities: [C]) {
-        self.cities = cities
-        let count = cities.count
-        let wc = (count + 63) / 64
-        self.wordCount = wc
+struct FastFieldRef {
+    let offset: Int
+    let length: Int
+}
 
-        // Build bitmap index
-        var bm = [UInt64](repeating: 0, count: 36 * wc)
-        for i in 0..<count {
-            let wordIdx = i / 64
-            let bitMask: UInt64 = 1 << (i % 64)
+struct FoldFieldRef {
+    let offset: Int
+    let length: Int
+}
 
-            // Closure that records ASCII chars from a field
-            let record: (String) -> Bool = { field in
-                var f = field
-                f.withUTF8 { buf in
-                    for k in 0..<buf.count {
-                        let b = buf[k]
-                        let slot: Int
-                        if b >= 0x61 && b <= 0x7A {       // a-z
-                            slot = Int(b - 0x61)
-                        } else if b >= 0x41 && b <= 0x5A { // A-Z → lowercase
-                            slot = Int(b - 0x41)
-                        } else if b >= 0x30 && b <= 0x39 { // 0-9
-                            slot = Int(b - 0x30) + 26
-                        } else {
-                            continue
-                        }
-                        bm[slot * wc + wordIdx] |= bitMask
-                    }
-                }
-                return false // return false to iterate all fields
-            }
+struct PreparedSearchFields {
+    let primaryFast: FieldSpan
+    let primaryFold: FieldSpan
+    let alternateFast: FieldSpan
+    let alternateFold: FieldSpan
+}
 
-            _ = cities[i].matchesPrimaryField(record)
-            _ = cities[i].matchesAlternateField(record)
+public struct PackedSearchFields {
+    let prepared: [PreparedSearchFields]
+    let fieldBytes: [UInt8]
+    let fastFieldRefs: [FastFieldRef]
+    let foldFieldRefs: [FoldFieldRef]
+    let foldStrings: [String]
+
+    var cityCount: Int { prepared.count }
+
+    init(
+        prepared: [PreparedSearchFields],
+        fieldBytes: [UInt8],
+        fastFieldRefs: [FastFieldRef],
+        foldFieldRefs: [FoldFieldRef]
+    ) {
+        self.prepared = prepared
+        self.fieldBytes = fieldBytes
+        self.fastFieldRefs = fastFieldRefs
+        self.foldFieldRefs = foldFieldRefs
+
+        var foldStrings: [String] = []
+        foldStrings.reserveCapacity(foldFieldRefs.count)
+        for field in foldFieldRefs {
+            let range = field.offset..<(field.offset + field.length)
+            foldStrings.append(String(decoding: fieldBytes[range], as: UTF8.self))
         }
-        self.bitmaps = bm
+        self.foldStrings = foldStrings
     }
 
-    /// One-shot search with bitmap filtering and early-exit.
-    ///
-    /// Results are ordered by:
-    /// 1) primary name field matches by population,
-    /// 2) alternate name field matches by population.
+    static func build<C: SearchableCity>(_ cities: [C]) -> PackedSearchFields {
+        var prepared: [PreparedSearchFields] = []
+        var fieldBytes: [UInt8] = []
+        var fastFieldRefs: [FastFieldRef] = []
+        var foldFieldRefs: [FoldFieldRef] = []
+
+        prepared.reserveCapacity(cities.count)
+        fastFieldRefs.reserveCapacity(cities.count * 4)
+        foldFieldRefs.reserveCapacity(cities.count)
+
+        @inline(__always)
+        func appendFieldBytes(_ field: String) -> (offset: Int, length: Int) {
+            let offset = fieldBytes.count
+            let utf8 = field.utf8
+            fieldBytes.append(contentsOf: utf8)
+            return (offset, utf8.count)
+        }
+
+        for city in cities {
+            let primaryFastStart = fastFieldRefs.count
+            let primaryFoldStart = foldFieldRefs.count
+
+            forEachPrimarySearchField(city) { field in
+                let bytes = appendFieldBytes(field)
+                if CasefoldingCache.stringNeedsFoldLookup(field) {
+                    foldFieldRefs.append(FoldFieldRef(offset: bytes.offset, length: bytes.length))
+                } else {
+                    fastFieldRefs.append(FastFieldRef(offset: bytes.offset, length: bytes.length))
+                }
+            }
+
+            let primaryFast = FieldSpan(start: primaryFastStart, count: fastFieldRefs.count - primaryFastStart)
+            let primaryFold = FieldSpan(start: primaryFoldStart, count: foldFieldRefs.count - primaryFoldStart)
+            let alternateFastStart = fastFieldRefs.count
+            let alternateFoldStart = foldFieldRefs.count
+
+            forEachAlternateSearchField(city) { field in
+                let bytes = appendFieldBytes(field)
+                if CasefoldingCache.stringNeedsFoldLookup(field) {
+                    foldFieldRefs.append(FoldFieldRef(offset: bytes.offset, length: bytes.length))
+                } else {
+                    fastFieldRefs.append(FastFieldRef(offset: bytes.offset, length: bytes.length))
+                }
+            }
+
+            let alternateFast = FieldSpan(start: alternateFastStart, count: fastFieldRefs.count - alternateFastStart)
+            let alternateFold = FieldSpan(start: alternateFoldStart, count: foldFieldRefs.count - alternateFoldStart)
+            prepared.append(PreparedSearchFields(
+                primaryFast: primaryFast,
+                primaryFold: primaryFold,
+                alternateFast: alternateFast,
+                alternateFold: alternateFold
+            ))
+        }
+
+        return PackedSearchFields(
+            prepared: prepared,
+            fieldBytes: fieldBytes,
+            fastFieldRefs: fastFieldRefs,
+            foldFieldRefs: foldFieldRefs
+        )
+    }
+}
+
+@inline(__always)
+func forEachPrimarySearchField<C: SearchableCity>(_ city: C, _ visit: (String) -> Void) {
+    let collector: (String) -> Bool = {
+        visit($0)
+        return false
+    }
+    _ = city.matchPrimaryNames(collector, collector)
+}
+
+@inline(__always)
+func forEachAlternateSearchField<C: SearchableCity>(_ city: C, _ visit: (String) -> Void) {
+    let collector: (String) -> Bool = {
+        visit($0)
+        return false
+    }
+    _ = city.matchAlternateNames(collector, collector)
+}
+
+@inline(__always)
+func asciiCaseInsensitiveContains(
+    _ hp: UnsafePointer<UInt8>, _ hLen: Int,
+    _ np: UnsafePointer<UInt8>, _ nl: Int
+) -> Bool {
+    guard nl > 0, hLen >= nl else { return nl == 0 }
+    let first = np[0]
+    let lastStart = hLen &- nl
+    var hPos = 0
+    while hPos <= lastStart {
+        let b0 = hp[hPos]
+        let folded0 = (b0 >= 0x41 && b0 <= 0x5A) ? (b0 | 0x20) : b0
+        if folded0 != first {
+            hPos &+= 1
+            continue
+        }
+
+        var hi = hPos &+ 1
+        var ni = 1
+        while ni < nl {
+            let b = hp[hi]
+            let folded = (b >= 0x41 && b <= 0x5A) ? (b | 0x20) : b
+            if folded != np[ni] { break }
+            hi &+= 1
+            ni &+= 1
+        }
+        if ni == nl { return true }
+        hPos &+= 1
+    }
+    return false
+}
+
+/// Inline fold-and-compare substring search on UTF-8 bytes.
+/// ASCII bytes are lowercased on the fly; non-ASCII bytes are folded via the cache.
+@inline(__always)
+func foldedContains(
+    _ hp: UnsafePointer<UInt8>, _ hLen: Int,
+    _ np: UnsafePointer<UInt8>, _ nl: Int,
+    _ fold: FoldLookupContext
+) -> Bool {
+    guard nl > 0, hLen >= nl else { return nl == 0 }
+    var hPos = 0
+    while hPos < hLen {
+        var hi = hPos
+        var ni = 0
+
+        inner: while ni < nl && hi < hLen {
+            let b = hp[hi]
+            if b < 0x80 {
+                let folded = (b >= 0x41 && b <= 0x5A) ? (b | 0x20) : b
+                if folded != np[ni] { break inner }
+                hi &+= 1
+                ni &+= 1
+                continue
+            }
+
+            let seqLen: Int
+            let scalar: UInt32
+            if b < 0xE0 {
+                seqLen = 2
+                guard hi &+ 1 < hLen else { break inner }
+                scalar = (UInt32(b & 0x1F) << 6) | UInt32(hp[hi &+ 1] & 0x3F)
+            } else if b < 0xF0 {
+                seqLen = 3
+                guard hi &+ 2 < hLen else { break inner }
+                scalar = (UInt32(b & 0x0F) << 12)
+                    | (UInt32(hp[hi &+ 1] & 0x3F) << 6)
+                    | UInt32(hp[hi &+ 2] & 0x3F)
+            } else {
+                seqLen = 4
+                guard hi &+ 3 < hLen else { break inner }
+                scalar = (UInt32(b & 0x07) << 18)
+                    | (UInt32(hp[hi &+ 1] & 0x3F) << 12)
+                    | (UInt32(hp[hi &+ 2] & 0x3F) << 6)
+                    | UInt32(hp[hi &+ 3] & 0x3F)
+            }
+
+            if let raw = lookupFoldRaw(
+                scalar,
+                fold.rawTable,
+                fold.displacements,
+                fold.tableSize,
+                fold.bucketCount,
+                fold.seed1,
+                fold.seed2
+            ) {
+                let entry = FoldEntry(raw: raw)
+                let fLen = entry.count
+                if ni &+ fLen > nl {
+                    // Fold expansion exceeds remaining needle — check partial match.
+                    let remaining = nl &- ni
+                    for k in 0..<remaining {
+                        if entry.byte(k) != np[ni &+ k] { break inner }
+                    }
+                    ni = nl
+                    break inner
+                }
+                for k in 0..<fLen {
+                    if entry.byte(k) != np[ni &+ k] { break inner }
+                }
+                ni &+= fLen
+            } else {
+                if ni &+ seqLen > nl { break inner }
+                for k in 0..<seqLen {
+                    if hp[hi &+ k] != np[ni &+ k] { break inner }
+                }
+                ni &+= seqLen
+            }
+            hi &+= seqLen
+        }
+
+        if ni >= nl { return true }
+        let b = hp[hPos]
+        if b < 0x80 { hPos &+= 1 }
+        else if b < 0xE0 { hPos &+= 2 }
+        else if b < 0xF0 { hPos &+= 3 }
+        else { hPos &+= 4 }
+    }
+    return false
+}
+
+/// Searches cities using optional casefold cache and optional search index.
+/// - If no casefold cache: falls back to `String.range(of:options:)`.
+/// - If no search index: falls back to full scan.
+public final class CitySearcher<C: SearchableCity> {
+    let cities: [C]
+    let packedSearchFields: PackedSearchFields
+    public let casefoldingCache: CasefoldingCache?
+    public let searchIndex: SearchIndex?
+
+    public init(
+        cities: [C],
+        casefoldingCache: CasefoldingCache? = nil,
+        searchIndex: SearchIndex? = nil,
+        packedSearchFields: PackedSearchFields? = nil
+    ) {
+        self.cities = cities
+        if let packedSearchFields, packedSearchFields.cityCount == cities.count {
+            self.packedSearchFields = packedSearchFields
+        } else {
+            self.packedSearchFields = PackedSearchFields.build(cities)
+        }
+        self.casefoldingCache = casefoldingCache
+        if let searchIndex, searchIndex.cityCount == cities.count {
+            self.searchIndex = searchIndex
+        } else {
+            self.searchIndex = nil
+        }
+    }
+
+    // MARK: - Search
+
     public func search(query: String, limit: Int = 20) -> [C] {
         let q = Query(query)
-        if q.value.isEmpty {
-            let effectiveLimit = limit < 0 ? cities.count : min(limit, cities.count)
-            return Array(cities.prefix(effectiveLimit))
+        guard !q.trimmed.isEmpty else {
+            let n = limit < 0 ? cities.count : min(limit, cities.count)
+            return Array(cities.prefix(n))
         }
 
         let effectiveLimit = limit < 0 ? cities.count : limit
-        let asciiChars = q.asciiChars
+        guard effectiveLimit > 0 else { return [] }
 
-        if !asciiChars.isEmpty {
-            // Build candidate bitmap by ANDing character bitmaps
-            var candidateBitmap = [UInt64](repeating: UInt64.max, count: wordCount)
-            for charSlot in asciiChars {
-                let offset = charSlot * wordCount
-                for w in 0..<wordCount {
-                    candidateBitmap[w] &= bitmaps[offset + w]
-                }
+        var primary: [C] = []
+        var alternate: [C] = []
+        primary.reserveCapacity(min(effectiveLimit, 64))
+        alternate.reserveCapacity(min(effectiveLimit, 64))
+
+        let appendMatch: (Int, Bool) -> Bool = { idx, isPrimary in
+            if isPrimary {
+                if primary.count < effectiveLimit { primary.append(self.cities[idx]) }
+                // We can stop as soon as we have enough primary matches because
+                // primary results always rank ahead of alternates.
+                return primary.count < effectiveLimit
+            } else if alternate.count < effectiveLimit {
+                alternate.append(self.cities[idx])
             }
-
-            var primary: [C] = []
-            var alternate: [C] = []
-
-            for w in 0..<wordCount {
-                var bits = candidateBitmap[w]
-                while bits != 0 {
-                    let bit = bits.trailingZeroBitCount
-                    bits &= bits &- 1
-                    let idx = w * 64 + bit
-                    if idx >= cities.count { break }
-
-                    let city = cities[idx]
-                    switch matchKind(city, query: q) {
-                    case .primary:
-                        primary.append(city)
-                        if primary.count >= effectiveLimit {
-                            let remaining = effectiveLimit - primary.count
-                            if remaining > 0 {
-                                return Array(primary.prefix(effectiveLimit)) + Array(alternate.prefix(remaining))
-                            }
-                            return Array(primary.prefix(effectiveLimit))
-                        }
-                    case .alternate:
-                        if alternate.count < effectiveLimit {
-                            alternate.append(city)
-                        }
-                    case .none:
-                        break
-                    }
-                }
-            }
-
-            let remaining = effectiveLimit - primary.count
-            if remaining > 0 {
-                return primary + Array(alternate.prefix(remaining))
-            }
-            return primary
-        } else {
-            // Pure non-ASCII (e.g. CJK) — linear scan
-            var primary: [C] = []
-            var alternate: [C] = []
-
-            for i in 0..<cities.count {
-                let city = cities[i]
-                switch matchKind(city, query: q) {
-                case .primary:
-                    primary.append(city)
-                    if primary.count >= effectiveLimit {
-                        let remaining = effectiveLimit - primary.count
-                        if remaining > 0 {
-                            return Array(primary.prefix(effectiveLimit)) + Array(alternate.prefix(remaining))
-                        }
-                        return Array(primary.prefix(effectiveLimit))
-                    }
-                case .alternate:
-                    if alternate.count < effectiveLimit {
-                        alternate.append(city)
-                    }
-                case .none:
-                    break
-                }
-            }
-
-            let remaining = effectiveLimit - primary.count
-            if remaining > 0 {
-                return primary + Array(alternate.prefix(remaining))
-            }
-            return primary
+            return true
         }
+
+        if let searchIndex {
+            guard let bitmap = searchIndex.candidates(for: q.foldedScalars) else { return [] }
+            scanBitmap(bitmap, query: q, body: appendMatch)
+        } else {
+            scanAll(q, body: appendMatch)
+        }
+
+        if primary.count >= effectiveLimit {
+            return Array(primary.prefix(effectiveLimit))
+        }
+
+        let remaining = effectiveLimit - primary.count
+        if remaining > 0 {
+            primary.append(contentsOf: alternate.prefix(remaining))
+        }
+        return primary
     }
 
-    /// Creates a new progressive search context.
     public func newSearch() -> SearchContext<C> {
         SearchContext(searcher: self)
     }
 
-    // MARK: - Match Classification
+    // MARK: - Internals
 
-    private enum MatchKind {
-        case none
+    enum MatchKind {
         case primary
         case alternate
+        case none
     }
 
-    /// Checks whether a city matches the query and in which tier.
-    private func matchKind(_ city: C, query: Query) -> MatchKind {
-        if query.isASCII {
-            let test: (String) -> Bool = { field in
-                Self.containsASCII(field, query)
+    @inline(__always)
+    private func matchesFastSpan(
+        _ span: FieldSpan,
+        _ bytes: UnsafePointer<UInt8>,
+        _ np: UnsafePointer<UInt8>,
+        _ nl: Int
+    ) -> Bool {
+        let end = span.start + span.count
+        guard span.count > 0 else { return false }
+        for index in span.start..<end {
+            let field = packedSearchFields.fastFieldRefs[index]
+            if asciiCaseInsensitiveContains(bytes.advanced(by: field.offset), field.length, np, nl) {
+                return true
             }
-            if city.matchesPrimaryField(test) { return .primary }
-            if city.matchesAlternateField(test) { return .alternate }
-            return .none
         }
+        return false
+    }
 
-        if query.isCaseInvariant {
-            let test: (String) -> Bool = { field in
-                Self.containsBytes(field, needle: query.lowerBytes)
+    @inline(__always)
+    private func matchesFoldSpanWithRange(
+        _ span: FieldSpan,
+        _ query: Query
+    ) -> Bool {
+        let end = span.start + span.count
+        guard span.count > 0 else { return false }
+        for index in span.start..<end {
+            if packedSearchFields.foldStrings[index]
+                .folding(options: searchFoldOptions, locale: nil)
+                .range(of: query.folded, options: .literal) != nil {
+                return true
             }
-            if city.matchesPrimaryField(test) { return .primary }
-            if city.matchesAlternateField(test) { return .alternate }
-            return .none
         }
+        return false
+    }
 
-        if query.hasComplexCaseMapping {
-            let test: (String) -> Bool = { field in
-                field.range(of: query.value, options: [.caseInsensitive, .literal]) != nil
+    @inline(__always)
+    private func matchesFoldSpanWithCache(
+        _ span: FieldSpan,
+        _ bytes: UnsafePointer<UInt8>,
+        _ np: UnsafePointer<UInt8>,
+        _ nl: Int,
+        _ fold: FoldLookupContext
+    ) -> Bool {
+        let end = span.start + span.count
+        guard span.count > 0 else { return false }
+        for index in span.start..<end {
+            let field = packedSearchFields.foldFieldRefs[index]
+            if foldedContains(bytes.advanced(by: field.offset), field.length, np, nl, fold) {
+                return true
             }
-            if city.matchesPrimaryField(test) { return .primary }
-            if city.matchesAlternateField(test) { return .alternate }
-            return .none
         }
+        return false
+    }
 
-        let test: (String) -> Bool = { field in
-            Self.containsUTF8(field, query)
+    @inline(__always)
+    private func classifyPreparedCityWithRange(
+        _ i: Int,
+        _ bytes: UnsafePointer<UInt8>,
+        _ np: UnsafePointer<UInt8>,
+        _ nl: Int,
+        _ query: Query
+    ) -> MatchKind {
+        let fields = packedSearchFields.prepared[i]
+
+        if matchesFastSpan(fields.primaryFast, bytes, np, nl) || matchesFoldSpanWithRange(fields.primaryFold, query) {
+            return .primary
         }
-        if city.matchesPrimaryField(test) { return .primary }
-        if city.matchesAlternateField(test) { return .alternate }
+        if matchesFastSpan(fields.alternateFast, bytes, np, nl) || matchesFoldSpanWithRange(fields.alternateFold, query) {
+            return .alternate
+        }
         return .none
     }
 
-    // MARK: - Substring Matching
+    @inline(__always)
+    private func classifyPreparedCityWithCache(
+        _ i: Int,
+        _ bytes: UnsafePointer<UInt8>,
+        _ np: UnsafePointer<UInt8>,
+        _ nl: Int,
+        _ fold: FoldLookupContext
+    ) -> MatchKind {
+        let fields = packedSearchFields.prepared[i]
 
-    /// Case-insensitive ASCII substring search via inline byte folding.
-    static func containsASCII(_ haystack: String, _ query: Query) -> Bool {
-        var h = haystack
-        let qBytes = query.lowerBytes
-        return h.withUTF8 { hBuf in
-            let hLen = hBuf.count
-            let qLen = qBytes.count
-            guard qLen > 0, qLen <= hLen else { return qLen == 0 }
+        if matchesFastSpan(fields.primaryFast, bytes, np, nl)
+            || matchesFoldSpanWithCache(fields.primaryFold, bytes, np, nl, fold) {
+            return .primary
+        }
+        if matchesFastSpan(fields.alternateFast, bytes, np, nl)
+            || matchesFoldSpanWithCache(fields.alternateFold, bytes, np, nl, fold) {
+            return .alternate
+        }
+        return .none
+    }
 
-            let first = qBytes[0]
-            let limit = hLen - qLen
-            for i in 0...limit {
-                let hByte = hBuf[i]
-                if hByte >= 0x80 { continue }
-                let hLower = (hByte >= 0x41 && hByte <= 0x5A) ? hByte &+ 0x20 : hByte
-                if hLower == first {
-                    var matched = true
-                    for j in 1..<qLen {
-                        let hb = hBuf[i + j]
-                        if hb >= 0x80 { matched = false; break }
-                        let hl = (hb >= 0x41 && hb <= 0x5A) ? hb &+ 0x20 : hb
-                        if hl != qBytes[j] {
-                            matched = false
-                            break
+    private func withFoldContext(
+        _ needle: [UInt8],
+        _ body: (UnsafePointer<UInt8>, Int, FoldLookupContext) -> Void
+    ) {
+        guard let casefoldingCache else { return }
+        let rawTable = casefoldingCache.rawTable
+        let displacements = casefoldingCache.displacements
+        needle.withUnsafeBufferPointer { nBuf in
+            guard let np = nBuf.baseAddress, nBuf.count > 0 else { return }
+            if rawTable.isEmpty || displacements.isEmpty {
+                var rawSentinel: UInt64 = 0
+                var displacementSentinel: Int32 = 0
+                withUnsafePointer(to: &rawSentinel) { rawPtr in
+                    withUnsafePointer(to: &displacementSentinel) { displacementPtr in
+                        let context = FoldLookupContext(
+                            rawTable: rawPtr,
+                            displacements: displacementPtr,
+                            tableSize: 0,
+                            bucketCount: 0,
+                            seed1: casefoldingCache.seed1,
+                            seed2: casefoldingCache.seed2
+                        )
+                        body(np, nBuf.count, context)
+                    }
+                }
+                return
+            }
+
+            rawTable.withUnsafeBufferPointer { tableBuf in
+                displacements.withUnsafeBufferPointer { displacementBuf in
+                    let context = FoldLookupContext(
+                        rawTable: tableBuf.baseAddress!,
+                        displacements: displacementBuf.baseAddress!,
+                        tableSize: tableBuf.count,
+                        bucketCount: displacementBuf.count,
+                        seed1: casefoldingCache.seed1,
+                        seed2: casefoldingCache.seed2
+                    )
+                    body(np, nBuf.count, context)
+                }
+            }
+        }
+    }
+
+    func scanAll(_ query: Query, body: (Int, Bool) -> Bool) {
+        if casefoldingCache == nil {
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                query.foldedBytes.withUnsafeBufferPointer { needleBuf in
+                    guard let np = needleBuf.baseAddress else { return }
+                    for i in 0..<cities.count {
+                        switch classifyPreparedCityWithRange(i, bytes, np, needleBuf.count, query) {
+                        case .primary:
+                            if !body(i, true) { return }
+                        case .alternate:
+                            if !body(i, false) { return }
+                        case .none: break
                         }
                     }
-                    if matched { return true }
                 }
             }
-            return false
+            return
+        }
+
+        withFoldContext(query.foldedBytes) { np, nl, fold in
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                for i in 0..<cities.count {
+                    switch classifyPreparedCityWithCache(i, bytes, np, nl, fold) {
+                    case .primary:
+                        if !body(i, true) { return }
+                    case .alternate:
+                        if !body(i, false) { return }
+                    case .none: break
+                    }
+                }
+            }
         }
     }
 
-    /// Case-insensitive UTF-8 substring search with early-exit optimization.
-    ///
-    /// For case-varying scripts, uses a 3-pointer scan against lower/upper query bytes.
-    static func containsUTF8(_ haystack: String, _ query: Query) -> Bool {
-        var h = haystack
-        let lo = query.lowerBytes
-        let up = query.upperBytes
-        let loLen = lo.count
-        let upLen = up.count
-
-        return h.withUTF8 { hBuf in
-            let hLen = hBuf.count
-            guard loLen > 0 else { return true }
-            guard loLen <= hLen else { return false }
-            guard upLen > 0 else { return false }
-
-            var start = 0
-            while start < hLen {
-                // Early exit: not enough bytes remaining
-                if hLen - start < loLen { return false }
-
-                let startCharLen = utf8LeadingCharLen(hBuf[start])
-                if startCharLen == 0 || start + startCharLen > hLen {
-                    start += 1
-                    continue
+    func scanBitmap(_ bitmap: [UInt64], query: Query, body: (Int, Bool) -> Bool) {
+        if casefoldingCache == nil {
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                query.foldedBytes.withUnsafeBufferPointer { needleBuf in
+                    guard let np = needleBuf.baseAddress else { return }
+                    let wordCount = bitmap.count
+                    for w in 0..<wordCount {
+                        var bits = bitmap[w]
+                        while bits != 0 {
+                            let bit = bits.trailingZeroBitCount
+                            bits &= bits &- 1
+                            let i = w * 64 + bit
+                            switch classifyPreparedCityWithRange(i, bytes, np, needleBuf.count, query) {
+                            case .primary:
+                                if !body(i, true) { return }
+                            case .alternate:
+                                if !body(i, false) { return }
+                            case .none: break
+                            }
+                        }
+                    }
                 }
-
-                var hPtr = start
-                var lPtr = 0
-                var uPtr = 0
-                var matched = true
-
-                while lPtr < loLen {
-                    guard hPtr < hLen, uPtr < upLen else {
-                        matched = false
-                        break
-                    }
-
-                    let hCharLen = utf8LeadingCharLen(hBuf[hPtr])
-                    let lCharLen = utf8LeadingCharLen(lo[lPtr])
-                    let uCharLen = utf8LeadingCharLen(up[uPtr])
-
-                    guard hCharLen > 0, lCharLen > 0, uCharLen > 0,
-                          hPtr + hCharLen <= hLen,
-                          lPtr + lCharLen <= loLen,
-                          uPtr + uCharLen <= upLen else {
-                        matched = false
-                        break
-                    }
-
-                    if hCharLen == lCharLen && bytesEqual(hBuf, hPtr, lo, lPtr, hCharLen) {
-                        hPtr += hCharLen
-                        lPtr += lCharLen
-                        uPtr += uCharLen
-                        continue
-                    }
-                    if hCharLen == uCharLen && bytesEqual(hBuf, hPtr, up, uPtr, hCharLen) {
-                        hPtr += hCharLen
-                        lPtr += lCharLen
-                        uPtr += uCharLen
-                        continue
-                    }
-
-                    matched = false
-                    break
-                }
-
-                if matched, lPtr == loLen, uPtr == upLen {
-                    return true
-                }
-
-                start += startCharLen
             }
-            return false
+            return
+        }
+
+        withFoldContext(query.foldedBytes) { np, nl, fold in
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                let wordCount = bitmap.count
+                for w in 0..<wordCount {
+                    var bits = bitmap[w]
+                    while bits != 0 {
+                        let bit = bits.trailingZeroBitCount
+                        bits &= bits &- 1
+                        let i = w * 64 + bit
+                        switch classifyPreparedCityWithCache(i, bytes, np, nl, fold) {
+                        case .primary:
+                            if !body(i, true) { return }
+                        case .alternate:
+                            if !body(i, false) { return }
+                        case .none: break
+                        }
+                    }
+                }
+            }
         }
     }
 
-    @inline(__always)
-    static func containsBytes(_ haystack: String, needle: [UInt8]) -> Bool {
-        var h = haystack
-        return h.withUTF8 { hBuf in
-            let hLen = hBuf.count
-            let qLen = needle.count
-            guard qLen > 0, qLen <= hLen else { return qLen == 0 }
-
-            let first = needle[0]
-            let limit = hLen - qLen
-            for i in 0...limit {
-                if hBuf[i] != first { continue }
-
-                var matched = true
-                for j in 1..<qLen {
-                    if hBuf[i + j] != needle[j] {
-                        matched = false
-                        break
+    func scanIndices(_ indices: [Int32], query: Query, body: (Int, Bool) -> Bool) {
+        if casefoldingCache == nil {
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                query.foldedBytes.withUnsafeBufferPointer { needleBuf in
+                    guard let np = needleBuf.baseAddress else { return }
+                    for idx in indices {
+                        let i = Int(idx)
+                        switch classifyPreparedCityWithRange(i, bytes, np, needleBuf.count, query) {
+                        case .primary:
+                            if !body(i, true) { return }
+                        case .alternate:
+                            if !body(i, false) { return }
+                        case .none: break
+                        }
                     }
                 }
-                if matched { return true }
             }
-            return false
+            return
+        }
+
+        withFoldContext(query.foldedBytes) { np, nl, fold in
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                for idx in indices {
+                    let i = Int(idx)
+                    switch classifyPreparedCityWithCache(i, bytes, np, nl, fold) {
+                    case .primary:
+                        if !body(i, true) { return }
+                    case .alternate:
+                        if !body(i, false) { return }
+                    case .none: break
+                    }
+                }
+            }
         }
     }
 
-    /// Returns UTF-8 character length for a leading byte, or 0 for continuation/invalid.
-    @inline(__always)
-    static func utf8LeadingCharLen(_ b: UInt8) -> Int {
-        if b < 0x80 { return 1 }
-        if b < 0xC0 { return 0 } // continuation byte
-        if b < 0xE0 { return 2 }
-        if b < 0xF0 { return 3 }
-        if b < 0xF8 { return 4 }
-        return 0
-    }
+    func scanMergedIndices(_ lhs: [Int32], _ rhs: [Int32], query: Query, body: (Int, Bool) -> Bool) {
+        if casefoldingCache == nil {
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                query.foldedBytes.withUnsafeBufferPointer { needleBuf in
+                    guard let np = needleBuf.baseAddress else { return }
+                    var li = 0
+                    var ri = 0
+                    while li < lhs.count || ri < rhs.count {
+                        let idx: Int32
+                        if ri >= rhs.count || (li < lhs.count && lhs[li] <= rhs[ri]) {
+                            idx = lhs[li]
+                            li &+= 1
+                        } else {
+                            idx = rhs[ri]
+                            ri &+= 1
+                        }
 
-    /// Compares `len` bytes between haystack buffer and query byte array.
-    @inline(__always)
-    static func bytesEqual(
-        _ a: UnsafeBufferPointer<UInt8>, _ ai: Int,
-        _ b: [UInt8], _ bi: Int,
-        _ len: Int
-    ) -> Bool {
-        switch len {
-        case 1:
-            return a[ai] == b[bi]
-        case 2:
-            return a[ai] == b[bi] && a[ai + 1] == b[bi + 1]
-        case 3:
-            return a[ai] == b[bi] && a[ai + 1] == b[bi + 1] && a[ai + 2] == b[bi + 2]
-        default:
-            return a[ai] == b[bi] && a[ai + 1] == b[bi + 1] && a[ai + 2] == b[bi + 2] && a[ai + 3] == b[bi + 3]
+                        let i = Int(idx)
+                        switch classifyPreparedCityWithRange(i, bytes, np, needleBuf.count, query) {
+                        case .primary:
+                            if !body(i, true) { return }
+                        case .alternate:
+                            if !body(i, false) { return }
+                        case .none: break
+                        }
+                    }
+                }
+            }
+            return
+        }
+
+        withFoldContext(query.foldedBytes) { np, nl, fold in
+            packedSearchFields.fieldBytes.withUnsafeBufferPointer { fieldBuf in
+                guard let bytes = fieldBuf.baseAddress else { return }
+                var li = 0
+                var ri = 0
+                while li < lhs.count || ri < rhs.count {
+                    let idx: Int32
+                    if ri >= rhs.count || (li < lhs.count && lhs[li] <= rhs[ri]) {
+                        idx = lhs[li]
+                        li &+= 1
+                    } else {
+                        idx = rhs[ri]
+                        ri &+= 1
+                    }
+
+                    let i = Int(idx)
+                    switch classifyPreparedCityWithCache(i, bytes, np, nl, fold) {
+                    case .primary:
+                        if !body(i, true) { return }
+                    case .alternate:
+                        if !body(i, false) { return }
+                    case .none: break
+                    }
+                }
+            }
         }
     }
 }
 
 // MARK: - SearchContext
 
-/// Stateful search context for progressive query refinement.
-///
-/// Caches matched city indices and candidate bitmaps so that extending a query
-/// (prefix match) narrows the cached set instead of rescanning from scratch.
-///
-/// ```swift
-/// let ctx = searcher.newSearch()
-/// ctx.update(query: "new")
-/// ctx.update(query: "new yo")       // filters cached matches
-/// ctx.update(query: "new york")     // filters further
-/// ctx.update(query: "paris")        // not a prefix → full recompute
-/// let results = ctx.results(limit: 20)
-/// ```
 public final class SearchContext<C: SearchableCity> {
     private let searcher: CitySearcher<C>
     private var cities: [C] { searcher.cities }
 
     private var lastQuery: Query?
-    private var candidateBitmap: [UInt64]?
-    /// Matches in primary name fields, in population order.
     private var lastPrimaryMatches: [Int32] = []
-    /// Matches in alternate name fields, in population order.
     private var lastAlternateMatches: [Int32] = []
 
     init(searcher: CitySearcher<C>) {
         self.searcher = searcher
     }
 
-    /// Updates the search with a new query string.
     public func update(query rawQuery: String) {
         let query = Query(rawQuery)
-        if query.value.isEmpty {
+        guard !query.trimmed.isEmpty else {
             lastPrimaryMatches.removeAll(keepingCapacity: true)
             lastAlternateMatches.removeAll(keepingCapacity: true)
-            candidateBitmap = nil
             lastQuery = query
             return
         }
 
-        if let previousQuery = lastQuery, query.value == previousQuery.value {
-            return
-        }
+        if let prev = lastQuery, query.foldedBytes == prev.foldedBytes { return }
 
-        // Incremental: new query extends previous
-        if let previousQuery = lastQuery, !previousQuery.value.isEmpty,
-           query.value.hasPrefix(previousQuery.value), query.value != previousQuery.value {
-            filterCachedMatches(query, previousQuery: previousQuery)
+        if let prev = lastQuery, !prev.foldedBytes.isEmpty,
+           query.foldedBytes.starts(with: prev.foldedBytes) {
+            narrowMatches(query)
         } else {
-            // Full recompute
             fullScan(query)
         }
         lastQuery = query
     }
 
-    /// Returns up to `limit` results. Use `-1` for all results.
     public func results(limit: Int = 20) -> [C] {
-        guard let lastQuery, !lastQuery.value.isEmpty else {
-            let effectiveLimit = Self.normalizedLimit(limit, total: cities.count)
-            return Array(cities.prefix(effectiveLimit))
+        guard let lastQuery, !lastQuery.trimmed.isEmpty else {
+            let n = limit < 0 ? cities.count : min(limit, cities.count)
+            return Array(cities.prefix(n))
         }
+        let total = lastPrimaryMatches.count + lastAlternateMatches.count
+        let n = limit < 0 ? total : min(limit, total)
+        guard n > 0 else { return [] }
 
-        return materializeResults(limit: limit)
+        var results: [C] = []
+        results.reserveCapacity(n)
+        for idx in lastPrimaryMatches.prefix(n) {
+            results.append(cities[Int(idx)])
+        }
+        let remaining = n - results.count
+        if remaining > 0 {
+            for idx in lastAlternateMatches.prefix(remaining) {
+                results.append(cities[Int(idx)])
+            }
+        }
+        return results
     }
 
-    // MARK: - Private
-
     private func fullScan(_ query: Query) {
-        let asciiChars = query.asciiChars
-
-        // Build candidate bitmap
-        candidateBitmap = computeCandidateBitmap(for: asciiChars)
-
         var primary: [Int32] = []
         var alternate: [Int32] = []
 
-        if let bitmap = candidateBitmap {
-            let wc = searcher.wordCount
-            for w in 0..<wc {
-                var bits = bitmap[w]
-                while bits != 0 {
-                    let bit = bits.trailingZeroBitCount
-                    bits &= bits &- 1
-                    let idx = w * 64 + bit
-                    if idx >= cities.count { break }
-
-                    switch matchKind(cities[idx], query: query) {
-                    case .primary:
-                        primary.append(Int32(idx))
-                    case .alternate:
-                        alternate.append(Int32(idx))
-                    case .none:
-                        break
-                    }
-                }
+        if let searchIndex = searcher.searchIndex {
+            guard let bitmap = searchIndex.candidates(for: query.foldedScalars) else {
+                lastPrimaryMatches = primary
+                lastAlternateMatches = alternate
+                return
+            }
+            searcher.scanBitmap(bitmap, query: query) { idx, isPrimary in
+                if isPrimary { primary.append(Int32(idx)) }
+                else { alternate.append(Int32(idx)) }
+                return true
             }
         } else {
-            // No ASCII chars — linear scan
-            for i in 0..<cities.count {
-                switch matchKind(cities[i], query: query) {
-                case .primary:
-                    primary.append(Int32(i))
-                case .alternate:
-                    alternate.append(Int32(i))
-                case .none:
-                    break
-                }
+            searcher.scanAll(query) { idx, isPrimary in
+                if isPrimary { primary.append(Int32(idx)) }
+                else { alternate.append(Int32(idx)) }
+                return true
             }
         }
 
@@ -486,191 +764,38 @@ public final class SearchContext<C: SearchableCity> {
         lastAlternateMatches = alternate
     }
 
-    /// Filters cached candidates when the query is extended.
-    private func filterCachedMatches(_ query: Query, previousQuery: Query) {
-        // Narrow the candidate bitmap with new ASCII chars
-        let prevChars = Set(previousQuery.asciiChars)
-        let newChars = query.asciiChars.filter { !prevChars.contains($0) }
-        if !newChars.isEmpty, var bitmap = candidateBitmap {
-            let wc = searcher.wordCount
-            for charSlot in newChars {
-                let offset = charSlot * wc
-                for w in 0..<wc {
-                    bitmap[w] &= searcher.bitmaps[offset + w]
-                }
-            }
-            candidateBitmap = bitmap
-
-            // Filter matches to only those still set in narrowed bitmap
-            lastPrimaryMatches = lastPrimaryMatches.filter { idx in
-                let w = Int(idx) / 64
-                let bit: UInt64 = 1 << (Int(idx) % 64)
-                return bitmap[w] & bit != 0
-            }
-            lastAlternateMatches = lastAlternateMatches.filter { idx in
-                let w = Int(idx) / 64
-                let bit: UInt64 = 1 << (Int(idx) % 64)
-                return bitmap[w] & bit != 0
-            }
-        }
-
-        // Re-verify survivors and reclassify
+    private func narrowMatches(_ query: Query) {
         var nextPrimary: [Int32] = []
         var nextAlternate: [Int32] = []
         nextPrimary.reserveCapacity(lastPrimaryMatches.count)
         nextAlternate.reserveCapacity(lastAlternateMatches.count)
 
-        var i = 0
-        var j = 0
-        while i < lastPrimaryMatches.count || j < lastAlternateMatches.count {
-            let idx: Int32
-            if j >= lastAlternateMatches.count ||
-                (i < lastPrimaryMatches.count && lastPrimaryMatches[i] < lastAlternateMatches[j]) {
-                idx = lastPrimaryMatches[i]
-                i += 1
-            } else {
-                idx = lastAlternateMatches[j]
-                j += 1
-            }
-
-            switch matchKind(cities[Int(idx)], query: query) {
-            case .primary:
-                nextPrimary.append(idx)
-            case .alternate:
-                nextAlternate.append(idx)
-            case .none:
-                break
-            }
+        searcher.scanMergedIndices(lastPrimaryMatches, lastAlternateMatches, query: query) { idx, isPrimary in
+            if isPrimary { nextPrimary.append(Int32(idx)) }
+            else { nextAlternate.append(Int32(idx)) }
+            return true
         }
 
         lastPrimaryMatches = nextPrimary
         lastAlternateMatches = nextAlternate
     }
-
-    private func materializeResults(limit: Int) -> [C] {
-        let total = lastPrimaryMatches.count + lastAlternateMatches.count
-        let effectiveLimit = Self.normalizedLimit(limit, total: total)
-        guard effectiveLimit > 0 else { return [] }
-
-        var results: [C] = []
-        results.reserveCapacity(effectiveLimit)
-
-        let primaryCount = min(effectiveLimit, lastPrimaryMatches.count)
-        for idx in lastPrimaryMatches.prefix(primaryCount) {
-            results.append(cities[Int(idx)])
-        }
-        if results.count == effectiveLimit {
-            return results
-        }
-
-        let remaining = effectiveLimit - results.count
-        for idx in lastAlternateMatches.prefix(remaining) {
-            results.append(cities[Int(idx)])
-        }
-        return results
-    }
-
-    private static func normalizedLimit(_ limit: Int, total: Int) -> Int {
-        if limit < 0 { return total }
-        if limit == 0 { return 0 }
-        return min(limit, total)
-    }
-
-    // MARK: - Helpers
-
-    /// Computes candidate bitmap by ANDing character bitmaps for given char slots.
-    private func computeCandidateBitmap(for charSlots: [Int]) -> [UInt64]? {
-        guard !charSlots.isEmpty else { return nil }
-        let wc = searcher.wordCount
-        var bitmap = [UInt64](repeating: UInt64.max, count: wc)
-        for charSlot in charSlots {
-            let offset = charSlot * wc
-            for w in 0..<wc {
-                bitmap[w] &= searcher.bitmaps[offset + w]
-            }
-        }
-        return bitmap
-    }
-
-    private enum MatchKind {
-        case none
-        case primary
-        case alternate
-    }
-
-    /// Checks whether a city matches the query and in which tier.
-    private func matchKind(_ city: C, query: Query) -> MatchKind {
-        if query.isASCII {
-            let test: (String) -> Bool = { field in
-                CitySearcher<C>.containsASCII(field, query)
-            }
-            if city.matchesPrimaryField(test) { return .primary }
-            if city.matchesAlternateField(test) { return .alternate }
-            return .none
-        }
-
-        if query.isCaseInvariant {
-            let test: (String) -> Bool = { field in
-                CitySearcher<C>.containsBytes(field, needle: query.lowerBytes)
-            }
-            if city.matchesPrimaryField(test) { return .primary }
-            if city.matchesAlternateField(test) { return .alternate }
-            return .none
-        }
-
-        if query.hasComplexCaseMapping {
-            let test: (String) -> Bool = { field in
-                field.range(of: query.value, options: [.caseInsensitive, .literal]) != nil
-            }
-            if city.matchesPrimaryField(test) { return .primary }
-            if city.matchesAlternateField(test) { return .alternate }
-            return .none
-        }
-
-        let test: (String) -> Bool = { field in
-            CitySearcher<C>.containsUTF8(field, query)
-        }
-        if city.matchesPrimaryField(test) { return .primary }
-        if city.matchesAlternateField(test) { return .alternate }
-        return .none
-    }
 }
 
 // MARK: - Query
 
-/// Lowercased query string with pre-computed properties for fast substring matching.
 struct Query {
-    let value: String
-    let isASCII: Bool
-    /// Whether the query is case-invariant (e.g. CJK, Arabic) — lowercased == uppercased.
-    let isCaseInvariant: Bool
-    /// Rare case where lowercase/uppercase changed scalar count (e.g. ß -> SS).
-    let hasComplexCaseMapping: Bool
-    let lowerBytes: [UInt8]
-    let upperBytes: [UInt8]
-    /// Unique ASCII char slots (0-25 for a-z, 26-35 for 0-9) found in the query.
-    let asciiChars: [Int]
+    let trimmed: String
+    let folded: String
+    let foldedBytes: [UInt8]
+    let foldedScalars: [UInt32]
 
     init(_ rawQuery: String) {
-        let lowered = rawQuery.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        self.value = lowered
-        var ascii = true
-        var charSlotSet = Set<Int>()
-        for byte in lowered.utf8 {
-            if byte >= 0x80 {
-                ascii = false
-            } else if byte >= 0x61 && byte <= 0x7A { // a-z
-                charSlotSet.insert(Int(byte - 0x61))
-            } else if byte >= 0x30 && byte <= 0x39 { // 0-9
-                charSlotSet.insert(Int(byte - 0x30) + 26)
-            }
-        }
-        self.isASCII = ascii
-        self.asciiChars = Array(charSlotSet)
-        let uppered = lowered.uppercased()
-        self.isCaseInvariant = !ascii && uppered == lowered
-        self.hasComplexCaseMapping = !ascii && lowered.unicodeScalars.count != uppered.unicodeScalars.count
-        self.lowerBytes = Array(lowered.utf8)
-        self.upperBytes = Array(uppered.utf8)
+        let trimmed = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.trimmed = trimmed
+        let folded = trimmed.folding(options: searchFoldOptions, locale: nil)
+        self.folded = folded
+        let foldedBytes = Array(folded.utf8)
+        self.foldedBytes = foldedBytes
+        self.foldedScalars = folded.unicodeScalars.map { $0.value }
     }
 }
