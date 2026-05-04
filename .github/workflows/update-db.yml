@@ -20,26 +20,40 @@ jobs:
         run: |
           swift run BuildDB Sources/WorldCitiesDB/Resources/cities.wcdb
 
+      - name: Run benchmark
+        run: |
+          swift run -c release Benchmark --markdown BENCHMARK.md
+
       - name: Check for changes
         id: check
         run: |
-          if git diff --quiet Sources/WorldCitiesDB/Resources/cities.wcdb 2>/dev/null; then
+          if git diff --quiet -- Sources/WorldCitiesDB/Resources/cities.wcdb; then
+            echo "db_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "db_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet -- Sources/WorldCitiesDB/Resources/cities.wcdb BENCHMARK.md; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit updated database
+      - name: Commit updated database and benchmark
         if: steps.check.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Sources/WorldCitiesDB/Resources/cities.wcdb
-          git commit -m "Update cities database from GeoNames"
+          git add Sources/WorldCitiesDB/Resources/cities.wcdb BENCHMARK.md
+          if [ "${{ steps.check.outputs.db_changed }}" = "true" ]; then
+            git commit -m "Update cities database and benchmark results"
+          else
+            git commit -m "Update benchmark results"
+          fi
           git push
 
       - name: Tag new version
-        if: steps.check.outputs.changed == 'true'
+        if: steps.check.outputs.db_changed == 'true'
         run: |
           git fetch --tags
           LATEST=$(git tag -l --sort=-v:refname | head -1)
