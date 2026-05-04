@@ -18,7 +18,7 @@ jobs:
 
       - name: Build and run BuildDB
         run: |
-          swift run BuildDB Sources/WorldCitiesDB/Resources/cities.wcdb
+          swift run -c release BuildDB Sources/WorldCitiesDB/Resources/cities.wcdb
 
       - name: Run benchmark
         run: |
