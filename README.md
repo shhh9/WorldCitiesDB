@@ -2,8 +2,9 @@
 
 WorldCitiesDB is a Swift package that bundles a ready-to-use GeoNames city
 database and fast local search. It ships as a single compressed package
-resource, `cities.wcdb`, containing roughly 230,000 records from the GeoNames
-`cities500` dataset plus prebuilt search artifacts.
+resource, `cities.wcdb`, containing roughly 200,000 records from the GeoNames
+`cities500` dataset plus prebuilt search artifacts. Rows with `0` population
+are omitted during generation.
 
 The package has no external package dependencies. At runtime it loads the
 bundled database, validates checksums, decodes the city records into the model
@@ -12,7 +13,8 @@ keyword search.
 
 ## Features
 
-- Bundled GeoNames `cities500` data, sorted by population descending.
+- Bundled GeoNames `cities500` data, excluding zero-population rows and sorted
+  by population descending.
 - Admin level 1 and level 2 names from GeoNames admin code tables.
 - Full built-in `City` model, including coordinates, feature codes, country
   codes, admin codes, population, elevation, timezone, and modification date.
@@ -36,7 +38,7 @@ Add the package dependency:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/shhh9/WorldCitiesDB.git", from: "1.0.15"),
+    .package(url: "https://github.com/shhh9/WorldCitiesDB.git", from: "1.0.18"),
 ]
 ```
 
@@ -237,6 +239,9 @@ You can also pass an output file or directory:
 swift run BuildDB /tmp/cities.wcdb
 swift run BuildDB /tmp/output-directory
 ```
+
+`BuildDB` drops rows where `population == 0` and logs how many rows were
+removed before sorting and encoding the database.
 
 `BuildDB` downloads:
 

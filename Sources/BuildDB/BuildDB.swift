@@ -184,11 +184,17 @@ struct BuildDB {
         }
         print("Parsed \(cities.count) cities")
 
-        // 5. Sort by population descending
+        // 5. Drop zero-population rows so duplicate administrative records such as
+        // Hanoi's zero-population entry are not included in the bundled database.
+        let parsedCityCount = cities.count
+        cities.removeAll { $0.population == 0 }
+        print("Dropped \(parsedCityCount - cities.count) cities with population == 0")
+
+        // 6. Sort by population descending
         cities.sort { $0.population > $1.population }
         print("Sorted \(cities.count) cities by population")
 
-        // 6. Prepare metadata shared by the city database and search cache.
+        // 7. Prepare metadata shared by the city database and search cache.
         let generatedAt = ISO8601DateFormatter().string(from: Date())
         let cityMetadata = CityDatabaseMetadata(
             schemaVersion: CityDatabaseFile.currentSchemaVersion,
@@ -209,13 +215,13 @@ struct BuildDB {
             includesAdmin2Names: true
         )
 
-        // 7. Build precomputed search artifacts.
+        // 8. Build precomputed search artifacts.
         let searchStart = CFAbsoluteTimeGetCurrent()
         let searchArtifacts = SearchArtifacts(cities: cities)
         let searchElapsed = CFAbsoluteTimeGetCurrent() - searchStart
         print("Built search artifacts in \(String(format: "%.3f", searchElapsed))s")
 
-        // 8. Encode city database with bundled search artifacts.
+        // 9. Encode city database with bundled search artifacts.
         let encodeStart = CFAbsoluteTimeGetCurrent()
         let encodedCityDatabase = try CityDatabaseFile.serializedData(
             cities: cities,
@@ -225,7 +231,7 @@ struct BuildDB {
         let encodeElapsed = CFAbsoluteTimeGetCurrent() - encodeStart
         print("Encoded database in \(String(format: "%.3f", encodeElapsed))s (\(encodedCityDatabase.data.count / 1024) KB)")
 
-        // 9. Write output file.
+        // 10. Write output file.
         let outputDir = outputURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
@@ -237,7 +243,7 @@ struct BuildDB {
 
         print("Done! Database saved to \(outputURL.path) (\(encodedCityDatabase.data.count / 1024 / 1024) MB)")
 
-        // 10. Verify: print top 10 cities.
+        // 11. Verify: print top 10 cities.
         print("\n=== Top 10 cities by population ===")
         for city in cities.prefix(10) {
             printCity(city)
